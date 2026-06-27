@@ -157,6 +157,27 @@
     const uniq = (arr) => Array.from(new Set(arr));
     const labelOf = (p) => (p && (p.label || p.drug || p.condition)) || 'topic';
 
+    // NCBI E-utilities allows ~3 requests/sec without an API key. In comparison
+    // mode two pipelines run in parallel and can burst past that, making one arm's
+    // PubMed call 429 (which shows up as "0 studies"). Funnel ALL NCBI requests
+    // through one global throttle so they stay spaced regardless of concurrency.
+    const NCBI_GAP = 350;
+    let ncbiLast = 0;
+    let ncbiQueue = Promise.resolve();
+    function ncbiFetch(url) {
+      const slot = ncbiQueue.then(async () => {
+        const wait = NCBI_GAP - (Date.now() - ncbiLast);
+        if (wait > 0) await delay(wait);
+        ncbiLast = Date.now();
+      });
+      ncbiQueue = slot; // next caller waits for the throttle slot, not the fetch
+      return slot.then(async () => {
+        let r = await fetch(url);
+        if (r.status === 429) { await delay(1200); ncbiLast = Date.now(); r = await fetch(url); }
+        return r;
+      });
+    }
+
     function extractJSON(text) {
       if (!text) throw new Error('Empty AI response.');
       const tryParse = (s) => { try { return JSON.parse(s); } catch (e) { return undefined; } };
@@ -268,7 +289,7 @@ For comparisons, share the same condition across both arms and vary the drug/tre
     async function pubmedSearch(term, sort) {
       const s = sort ? `&sort=${enc(sort)}` : '';
       const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=${PUBMED_FETCH}&retmode=json${s}`;
-      const res = await fetch(url);
+      const res = await ncbiFetch(url);
       if (!res.ok) throw new Error('PubMed search failed');
       const json = await res.json();
       const ids = uniq((json.esearchresult && json.esearchresult.idlist) || []);
@@ -286,7 +307,7 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       }
       if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} };
 
-      const sumRes = await fetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
+      const sumRes = await ncbiFetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
       const sumJson = await sumRes.json();
       const result = (sumJson && sumJson.result) || {};
 
@@ -316,7 +337,7 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       let abstracts = '';
       try {
         const topIds = papers.slice(0, ABSTRACT_TOP).map((p) => p.pmid);
-        const absRes = await fetch(`${EUTILS}/efetch.fcgi?db=pubmed&id=${topIds.join(',')}&rettype=abstract&retmode=text`);
+        const absRes = await ncbiFetch(`${EUTILS}/efetch.fcgi?db=pubmed&id=${topIds.join(',')}&rettype=abstract&retmode=text`);
         if (absRes.ok) abstracts = await absRes.text();
       } catch (e) { /* abstracts are best-effort */ }
 

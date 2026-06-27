@@ -20,6 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-4-6';
+const ALLOWED_MODELS = new Set(['claude-sonnet-4-6', 'claude-haiku-4-5']);
 
 // --- minimal .env loader (no dependency) ---
 (() => {
@@ -58,6 +59,7 @@ async function handleClaude(req, res) {
   let body;
   try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { body = {}; }
   const { system, messages, max_tokens } = body;
+  const model = ALLOWED_MODELS.has(body && body.model) ? body.model : MODEL;
   if (!system || !Array.isArray(messages) || !messages.length) {
     res.writeHead(400, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'Request must include "system" and a non-empty "messages" array.' } }));
@@ -67,7 +69,7 @@ async function handleClaude(req, res) {
     const upstream = await fetch(ANTHROPIC_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: MODEL, max_tokens: Math.min(Math.max(parseInt(max_tokens, 10) || 4096, 256), 16000), system, messages }),
+      body: JSON.stringify({ model, max_tokens: Math.min(Math.max(parseInt(max_tokens, 10) || 4096, 256), 16000), system, messages }),
     });
     const text = await upstream.text();
     res.writeHead(upstream.status, { 'content-type': 'application/json' });

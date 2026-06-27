@@ -42,7 +42,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 
-  <!-- React (UMD) + Babel. No chart library — the timeline is hand-drawn SVG so nothing external can fail. -->
+  <!-- React (UMD) + Babel. No chart library — every chart is hand-drawn SVG so nothing external can fail. -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -77,7 +77,6 @@
 </head>
 <body>
   <div id="root">
-    <!-- Fallback shown only if the script never mounts -->
     <noscript style="display:block;padding:2rem;font-family:sans-serif">ClinicalLens requires JavaScript.</noscript>
   </div>
 
@@ -87,17 +86,23 @@
     /* ============================================================
        CONSTANTS
     ============================================================ */
-    const CLAUDE_PROXY = '/api/claude';      // serverless backend (key lives on the server)
+    const CLAUDE_PROXY = '/api/claude';
+    const MODEL_SYNTH = 'claude-sonnet-4-6';   // quality-critical synthesis
+    const MODEL_PARSE = 'claude-haiku-4-5';    // trivial query parsing — fast & cheap
 
     const EUTILS = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
     const CT_API = 'https://clinicaltrials.gov/api/v2/studies';
     const FDA_API = 'https://api.fda.gov/drug/event.json';
+
+    const PUBMED_FETCH = 200;   // pull a deep pool, then rank by study quality (not recency)
+    const ABSTRACT_TOP = 15;    // fetch full abstracts for the N highest-quality studies
 
     const EXAMPLE_CHIPS = [
       'Duchenne Muscular Dystrophy',
       'Voclosporin',
       'Childhood ALL',
       'Ozempic long-term outcomes',
+      'voclosporin vs tacrolimus FSGS',
     ];
 
     const EVIDENCE = {
@@ -121,12 +126,36 @@
       case_series:        'Case Series',
     };
 
+    // Evidence hierarchy used to rank PubMed records by study quality (top = strongest).
+    const EVIDENCE_TIERS = [
+      { key: 'meta',          label: 'Systematic review / Meta-analysis', rank: 1, color: '#059669' },
+      { key: 'rct',           label: 'Randomized controlled trial',       rank: 2, color: '#0EA5E9' },
+      { key: 'observational', label: 'Trial / cohort / observational',    rank: 3, color: '#1E40AF' },
+      { key: 'review',        label: 'Narrative review',                  rank: 4, color: '#CA8A04' },
+      { key: 'case',          label: 'Case report / series',              rank: 5, color: '#D97706' },
+      { key: 'other',         label: 'Other / unclassified',              rank: 6, color: '#94A3B8' },
+    ];
+    const TIER = EVIDENCE_TIERS.reduce((m, t) => { m[t.key] = t; return m; }, {});
+
+    function classifyPubTypes(types) {
+      const t = (types || []).map((x) => String(x).toLowerCase());
+      const has = (s) => t.some((x) => x.includes(s));
+      if (has('meta-analysis') || has('systematic review')) return 'meta';
+      if (has('randomized controlled trial') || has('controlled clinical trial')) return 'rct';
+      if (has('clinical trial') || has('observational study') || has('cohort') || has('comparative study') || has('multicenter study')) return 'observational';
+      if (has('review')) return 'review';
+      if (has('case report')) return 'case';
+      return 'other';
+    }
+
     /* ============================================================
        SMALL UTILITIES
     ============================================================ */
     const delay = (ms) => new Promise((r) => setTimeout(r, ms));
     const enc = encodeURIComponent;
     const fmtInt = (n) => (n == null || isNaN(n) ? '—' : Number(n).toLocaleString());
+    const uniq = (arr) => Array.from(new Set(arr));
+    const labelOf = (p) => (p && (p.label || p.drug || p.condition)) || 'topic';
 
     function extractJSON(text) {
       if (!text) throw new Error('Empty AI response.');
@@ -164,22 +193,18 @@
     /* ============================================================
        ANTHROPIC CALL (via serverless proxy — no key in the browser)
     ============================================================ */
-    async function callClaude(system, userContent, { maxTokens = 4096 } = {}) {
-      // NOTE: no assistant-message prefill — the conversation must end with a
-      // user message. We instruct the model to return only JSON and parse it.
+    async function callClaude(system, userContent, { maxTokens = 4096, model = MODEL_SYNTH } = {}) {
       const messages = [{ role: 'user', content: userContent + '\n\nRespond with only the raw JSON object — no markdown fences, no commentary.' }];
-
       let res;
       try {
         res = await fetch(CLAUDE_PROXY, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ system, messages, max_tokens: maxTokens }),
+          body: JSON.stringify({ system, messages, max_tokens: maxTokens, model }),
         });
       } catch (e) {
         throw new Error('Could not reach the synthesis backend. If running locally, start it with "node server.js" (or deploy to Vercel).');
       }
-
       if (!res.ok) {
         let detail = '';
         try { const j = await res.json(); detail = (j.error && (j.error.message || j.error)) || j.message || ''; } catch (e) {}
@@ -189,85 +214,107 @@
         if (res.status === 429) throw new Error('Anthropic rate limit reached. Wait a moment and try again.');
         throw new Error(`Synthesis backend error (${res.status}). ${detail}`);
       }
-
       const data = await res.json();
       if (data && data.error) throw new Error(data.error.message || String(data.error));
       if (data && data.stop_reason === 'max_tokens') {
-        throw new Error('The AI response was too long and got cut off. Try a more specific query (e.g. add a drug name).');
+        throw new Error('The AI response was too long and got cut off. Try a more specific query.');
       }
       const text = (data.content || []).map((c) => c.text || '').join('');
       return extractJSON(text);
     }
 
     /* ============================================================
-       STEP 1 — QUERY PARSING
+       STEP 1 — QUERY PARSING (Haiku, with a Sonnet fallback)
     ============================================================ */
-    const PARSE_SYSTEM = `You are a medical search query parser. Extract structured search terms from the user's query.
-The query may be ANY drug, disease, condition, treatment, biomarker, or combination — be fully general.
-Return ONLY a JSON object with these fields:
+    const PARSE_SYSTEM = `You are a medical search query parser. Extract structured search terms.
+The query may be ANY drug, disease, condition, treatment — or a COMPARISON of two treatments.
+Return ONLY a JSON object.
+
+If the user is comparing two interventions (e.g. "X vs Y", "X versus Y", "X compared to Y in <condition>"), return:
+{ "comparison": true, "arms": [ <armObject>, <armObject> ] }   // exactly two arms
+Otherwise return a single <armObject> that also includes "comparison": false.
+
+Each <armObject> has these fields:
 {
   "condition": "primary medical condition name",
   "meshTerm": "MeSH term if known, else null",
-  "drug": "drug name if mentioned, else null",
+  "drug": "drug/treatment name if mentioned, else null",
   "outcomeType": "one of: treatment_outcomes, drug_efficacy, survival, remission, safety, general",
   "pubmedQuery": "optimized PubMed search string using boolean operators",
-  "plainLanguageTopic": "what the user is asking about in plain English"
-}`;
+  "plainLanguageTopic": "what this is about in plain English",
+  "label": "short label, e.g. the drug or treatment name"
+}
+For comparisons, share the same condition across both arms and vary the drug/treatment.`;
 
     async function parseQuery(raw) {
-      return callClaude(PARSE_SYSTEM, `User query: "${raw}"`, { maxTokens: 600 });
+      const user = `User query: "${raw}"`;
+      try {
+        return await callClaude(PARSE_SYSTEM, user, { maxTokens: 900, model: MODEL_PARSE });
+      } catch (e) {
+        // Haiku may be unavailable on some keys — fall back to the synthesis model.
+        return callClaude(PARSE_SYSTEM, user, { maxTokens: 900, model: MODEL_SYNTH });
+      }
     }
 
     /* ============================================================
        STEP 2 — DATA FETCHERS (public APIs, run client-side)
     ============================================================ */
-    async function pubmedSearch(term) {
-      const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=50&retmode=json`;
+    async function pubmedSearch(term, sort) {
+      const s = sort ? `&sort=${enc(sort)}` : '';
+      const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=${PUBMED_FETCH}&retmode=json${s}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error('PubMed search failed');
       const json = await res.json();
-      const ids = (json.esearchresult && json.esearchresult.idlist) || [];
+      const ids = uniq((json.esearchresult && json.esearchresult.idlist) || []);
       const total = parseInt((json.esearchresult && json.esearchresult.count) || ids.length, 10) || ids.length;
       return { ids, total };
     }
 
-    async function fetchPubMed(parsed) {
-      // Try the optimized boolean query first; fall back to the bare condition so ANY topic resolves.
-      let { ids, total } = await pubmedSearch(parsed.pubmedQuery || parsed.condition || '');
+    async function fetchPubMed(parsed, sort) {
+      // "Best Match" (relevance) by default surfaces foundational + recent work,
+      // countering the recency bias of date-sorted results.
+      const sortMode = sort || 'relevance';
+      let { ids, total } = await pubmedSearch(parsed.pubmedQuery || parsed.condition || '', sortMode);
       if (ids.length === 0 && parsed.condition && parsed.condition !== parsed.pubmedQuery) {
-        await delay(300);
-        ({ ids, total } = await pubmedSearch(parsed.condition));
+        ({ ids, total } = await pubmedSearch(parsed.condition, sortMode));
       }
-      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '' };
+      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} };
 
-      await delay(300);
       const sumRes = await fetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
       const sumJson = await sumRes.json();
       const result = (sumJson && sumJson.result) || {};
 
-      const papers = ids.map((id) => {
+      let papers = ids.map((id) => {
         const d = result[id];
         if (!d) return null;
         const yraw = d.pubdate ? String(d.pubdate).split(' ')[0].replace(/[^0-9]/g, '') : '';
+        const pubtype = d.pubtype || [];
+        const category = classifyPubTypes(pubtype);
         return {
           pmid: id,
           title: d.title || '(no title)',
           authors: (d.authors || []).map((a) => a.name).slice(0, 6).join(', '),
           journal: d.fulljournalname || d.source || '',
           year: yraw.length === 4 ? parseInt(yraw, 10) : null,
-          pubtype: (d.pubtype || []).join(', '),
+          pubtype: pubtype.join(', '),
+          category,
+          tier: TIER[category].rank,
         };
       }).filter(Boolean);
 
+      // Rank by evidence tier first, recency second — the strongest evidence leads.
+      papers.sort((a, b) => (a.tier - b.tier) || ((b.year || 0) - (a.year || 0)));
+
+      const typeCounts = papers.reduce((m, p) => { m[p.category] = (m[p.category] || 0) + 1; return m; }, {});
+
       let abstracts = '';
       try {
-        await delay(300);
-        const topIds = ids.slice(0, 10);
+        const topIds = papers.slice(0, ABSTRACT_TOP).map((p) => p.pmid);
         const absRes = await fetch(`${EUTILS}/efetch.fcgi?db=pubmed&id=${topIds.join(',')}&rettype=abstract&retmode=text`);
         if (absRes.ok) abstracts = await absRes.text();
       } catch (e) { /* abstracts are best-effort */ }
 
-      return { ids, papers, count: papers.length, totalAvailable: total, abstracts };
+      return { ids, papers, count: papers.length, totalAvailable: total, abstracts, typeCounts };
     }
 
     function bucketPhase(phase) {
@@ -282,11 +329,12 @@ Return ONLY a JSON object with these fields:
       const params = new URLSearchParams();
       if (parsed.condition) params.append('query.cond', parsed.condition);
       if (parsed.drug) params.append('query.intr', parsed.drug);
-      params.append('pageSize', '20');
+      params.append('pageSize', '30');
       params.append('countTotal', 'true');
       const res = await fetch(`${CT_API}?${params.toString()}`);
       if (!res.ok) throw new Error('ClinicalTrials.gov request failed');
       const json = await res.json();
+      const seen = new Set();
       const studies = (json.studies || []).map((s) => {
         const p = s.protocolSection || {};
         const idm = p.identificationModule || {};
@@ -304,31 +352,48 @@ Return ONLY a JSON object with these fields:
           primaryOutcome: (oem.primaryOutcomes || []).map((o) => o.measure).slice(0, 3).join('; '),
           startDate: (stm.startDateStruct && stm.startDateStruct.date) || '',
           completionDate: (stm.completionDateStruct && stm.completionDateStruct.date) || '',
-          hasResults: !!s.hasResults,
         };
-      }).filter((s) => s.nctId);
+      }).filter((s) => s.nctId && !seen.has(s.nctId) && seen.add(s.nctId));
       return { studies, count: json.totalCount != null ? json.totalCount : studies.length };
+    }
+
+    // OpenFDA cascade: try several drug-name fields before giving up, so rare-disease
+    // drugs (often only indexed under generic/substance names) still surface safety data.
+    async function fdaCount(searchExpr) {
+      try {
+        const res = await fetch(`${FDA_API}?search=${searchExpr}&count=patient.reaction.reactionmeddrapt.exact`);
+        if (!res.ok) return null;
+        const json = await res.json();
+        const total = (json.meta && json.meta.results && json.meta.results.total) || 0;
+        const topReactions = (json.results || []).slice(0, 15).map((r) => ({ term: r.term, count: r.count }));
+        if (!total && topReactions.length === 0) return null;
+        return { total, topReactions };
+      } catch (e) { return null; }
     }
 
     async function fetchFDA(parsed) {
       if (!parsed.drug) return null;
-      const drug = enc(`"${parsed.drug}"`);
-      try {
-        const cRes = await fetch(`${FDA_API}?search=patient.drug.medicinalproduct:${drug}&count=patient.reaction.reactionmeddrapt.exact`);
-        if (!cRes.ok) return null; // openFDA returns 404 when zero matches
-        const cJson = await cRes.json();
-        const total = (cJson.meta && cJson.meta.results && cJson.meta.results.total) || 0;
-        const topReactions = (cJson.results || []).slice(0, 15).map((r) => ({ term: r.term, count: r.count }));
-        let seriousCount = null;
-        try {
-          const sRes = await fetch(`${FDA_API}?search=patient.drug.medicinalproduct:${drug}+AND+serious:1&limit=1`);
-          if (sRes.ok) { const sJson = await sRes.json(); seriousCount = (sJson.meta && sJson.meta.results && sJson.meta.results.total) || 0; }
-        } catch (e) {}
-        if (!total && topReactions.length === 0) return null;
-        return { drug: parsed.drug, totalReports: total, topReactions, seriousCount };
-      } catch (e) {
-        return null;
+      const q = enc(`"${parsed.drug}"`);
+      const loose = enc(parsed.drug);
+      const candidates = [
+        { field: 'patient.drug.medicinalproduct', expr: `patient.drug.medicinalproduct:${q}` },
+        { field: 'patient.drug.openfda.generic_name', expr: `patient.drug.openfda.generic_name:${q}` },
+        { field: 'patient.drug.openfda.brand_name', expr: `patient.drug.openfda.brand_name:${q}` },
+        { field: 'patient.drug.openfda.substance_name', expr: `patient.drug.openfda.substance_name:${q}` },
+        { field: 'patient.drug.medicinalproduct', expr: `patient.drug.medicinalproduct:${loose}` },
+      ];
+      let matched = null;
+      for (const c of candidates) {
+        const r = await fdaCount(c.expr);
+        if (r) { matched = { ...r, matchedField: c.field, matchExpr: c.expr }; break; }
       }
+      if (!matched) return null;
+      let seriousCount = null;
+      try {
+        const sRes = await fetch(`${FDA_API}?search=${matched.matchExpr}+AND+serious:1&limit=1`);
+        if (sRes.ok) { const sJson = await sRes.json(); seriousCount = (sJson.meta && sJson.meta.results && sJson.meta.results.total) || 0; }
+      } catch (e) {}
+      return { drug: parsed.drug, totalReports: matched.total, topReactions: matched.topReactions, seriousCount };
     }
 
     function computeTimeline(papers) {
@@ -346,7 +411,8 @@ Return ONLY a JSON object with these fields:
        STEP 3 — STATISTICAL SYNTHESIS
     ============================================================ */
     const SYNTH_SYSTEM = `You are a clinical biostatistician and medical evidence synthesizer. You have been given raw data
-from PubMed, ClinicalTrials.gov, and OpenFDA about a medical topic.
+from PubMed, ClinicalTrials.gov, and OpenFDA about a medical topic. The PubMed records are pre-ranked by
+study quality (systematic reviews and RCTs first); weight the strongest evidence most heavily.
 
 Your job is to produce a rigorous, sourced statistical synthesis. You must:
 1. NEVER invent statistics — only report what is directly supported by the source data provided
@@ -383,19 +449,8 @@ Return ONLY a JSON object with this exact structure:
     "phase3": { "trialCount": number, "summary": "string" },
     "approved": { "count": number, "summary": "string" }
   },
-  "timelineData": [
-    { "year": number, "studyCount": number, "label": "optional context" }
-  ],
-  "activeTrials": [
-    {
-      "nctId": "string",
-      "title": "string",
-      "phase": "string",
-      "enrollment": number,
-      "status": "string",
-      "url": "https://clinicaltrials.gov/study/{nctId}"
-    }
-  ],
+  "timelineData": [ { "year": number, "studyCount": number, "label": "optional context" } ],
+  "activeTrials": [ { "nctId": "string", "title": "string", "phase": "string", "enrollment": number, "status": "string", "url": "https://clinicaltrials.gov/study/{nctId}" } ],
   "knowledgeGaps": ["list of areas where evidence is thin or missing"],
   "patientConsiderations": ["list of plain-language points specifically relevant to patients and families"],
   "researcherNotes": ["list of methodological notes relevant to clinicians or researchers"],
@@ -412,30 +467,39 @@ Return ONLY a JSON object with this exact structure:
         pubmed: {
           totalAvailableInPubMed: pm ? pm.totalAvailable : 0,
           returnedForAnalysis: pm ? pm.count : 0,
-          papers: pm ? pm.papers.map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, type: p.pubtype })) : [],
-          abstractsTop10: pm ? (pm.abstracts || '').slice(0, 4500) : '',
+          studyTypeCounts: pm ? pm.typeCounts : {},
+          papers: pm ? pm.papers.slice(0, 60).map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, studyType: p.category })) : [],
+          abstractsHighestQuality: pm ? (pm.abstracts || '').slice(0, 4500) : '',
         },
         clinicalTrials: {
           totalMatching: ct ? ct.count : 0,
-          studies: ct ? ct.studies.map((s) => ({
-            nctId: s.nctId, title: s.title, phase: s.phase, status: s.status,
-            enrollment: s.enrollment, primaryOutcome: s.primaryOutcome,
-            startDate: s.startDate, completionDate: s.completionDate, hasResults: s.hasResults,
-          })) : [],
+          studies: ct ? ct.studies.map((s) => ({ nctId: s.nctId, title: s.title, phase: s.phase, status: s.status, enrollment: s.enrollment, primaryOutcome: s.primaryOutcome, startDate: s.startDate, completionDate: s.completionDate })) : [],
         },
         openFDA: fda,
         precomputedPublicationTimeline: timeline,
       };
-
       const user = `Here is the raw data retrieved live from the source APIs. Produce the synthesis JSON. ` +
         `Cite only PMIDs and NCT numbers that appear in this data. Use the precomputedPublicationTimeline ` +
         `values for timelineData (counted directly from the returned PubMed records).\n\n` +
-        `Keep the JSON compact so it fits in the response: include the 6-8 most important keyStatistics ` +
-        `(not more), at most 8 activeTrials, at most 6 items in each list field, and keep every text field ` +
-        `to 1-2 sentences. Do not pad.\n\n` +
+        `Keep the JSON compact: include the 6-8 most important keyStatistics, at most 8 activeTrials, at most ` +
+        `6 items in each list field, and keep every text field to 1-2 sentences. Do not pad.\n\n` +
         '<raw_data>\n' + JSON.stringify(payload) + '\n</raw_data>';
+      return callClaude(SYNTH_SYSTEM, user, { maxTokens: 12000, model: MODEL_SYNTH });
+    }
 
-      return callClaude(SYNTH_SYSTEM, user, { maxTokens: 12000 });
+    // Full single-topic pipeline (used for comparison arms; the single-query path
+    // below runs the same steps with granular progress).
+    async function gather(parsed, sort) {
+      const emptyPM = { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} };
+      const [pm, ct, fda] = await Promise.all([
+        fetchPubMed(parsed, sort).catch(() => emptyPM),
+        fetchTrials(parsed).catch(() => ({ studies: [], count: 0 })),
+        fetchFDA(parsed).catch(() => null),
+      ]);
+      const computedTimeline = computeTimeline(pm.papers);
+      const synthesis = await synthesizeData(parsed, pm, ct, fda, computedTimeline);
+      const fetchedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+      return { synthesis, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fetchedAt } };
     }
 
     /* ============================================================
@@ -454,6 +518,11 @@ Return ONLY a JSON object with this exact structure:
         users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></>,
         microscope: <><path d="M6 18h8" /><path d="M3 22h18" /><path d="M14 22a7 7 0 1 0 0-14h-1" /><path d="M9 14h2" /><path d="M9 12a2 2 0 0 1-2-2V6h6v4a2 2 0 0 1-2 2Z" /><path d="M12 6V3a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1v3" /></>,
         clock: <><circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" /></>,
+        layers: <><path d="m12 2 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5" /><path d="m3 17 9 5 9-5" /></>,
+        compass: <><circle cx="12" cy="12" r="10" /><path d="m16 8-6 2-2 6 6-2 2-6Z" /></>,
+        bars: <><path d="M3 3v18h18" /><rect x="7" y="11" width="3" height="6" /><rect x="12" y="7" width="3" height="10" /><rect x="17" y="13" width="3" height="4" /></>,
+        gap: <><circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" /></>,
+        scale: <><path d="m16 16 3-8 3 8c-2 1.5-4 1.5-6 0Z" /><path d="m2 16 3-8 3 8c-2 1.5-4 1.5-6 0Z" /><path d="M7 21h10" /><path d="M12 3v18" /><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" /></>,
       };
       return (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -475,7 +544,7 @@ Return ONLY a JSON object with this exact structure:
             <input
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder="Search any condition, drug, or treatment..."
+              placeholder="Search a condition or drug — or compare two with “A vs B”..."
               disabled={busy}
               className="ring-focus w-full h-14 pl-14 pr-32 rounded-xl border border-edge bg-white text-base text-ink placeholder:text-slate-400 shadow-card focus:border-accent transition disabled:opacity-60"
             />
@@ -563,7 +632,7 @@ Return ONLY a JSON object with this exact structure:
 
     function KeyStatisticCard({ stat }) {
       const q = QUALITY[stat.studyQuality] || QUALITY.very_low;
-      const ids = stat.sourceIds || [];
+      const ids = uniq((stat.sourceIds || []).map((x) => String(x).trim()).filter(Boolean));
       return (
         <div className="bg-white rounded-xl border border-edge shadow-card p-5 fade-up" style={{ borderLeft: `5px solid ${q.color}` }}>
           <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -606,11 +675,20 @@ Return ONLY a JSON object with this exact structure:
     }
 
     /* ============================================================
-       RESEARCH TIMELINE — hand-drawn SVG (no chart library)
+       RESEARCH TIMELINE — hand-drawn SVG
     ============================================================ */
-    function ResearchTimeline({ data }) {
+    function ResearchTimeline({ data, allOneYear, onBroaden }) {
       if (!data || data.length < 2) {
-        return <div className="text-sm text-sub bg-slate-50 rounded-lg p-4 border border-edge">Not enough dated publications to plot a research trend.</div>;
+        return (
+          <div className="text-sm text-sub bg-slate-50 rounded-lg p-4 border border-edge">
+            {allOneYear
+              ? <>All retrieved studies share a single publication year, so there's no trend to plot yet — this usually means a newly emerging evidence base.</>
+              : <>Not enough dated publications to plot a research trend.</>}
+            {onBroaden && (
+              <button onClick={onBroaden} className="ml-2 text-accent font-medium hover:underline">Broaden to most-recent results →</button>
+            )}
+          </div>
+        );
       }
       const W = 760, H = 260, padL = 40, padR = 18, padT = 16, padB = 34;
       const years = data.map((d) => d.year);
@@ -618,21 +696,17 @@ Return ONLY a JSON object with this exact structure:
       const maxC = Math.max(1, ...data.map((d) => d.studyCount));
       const sx = (yr) => padL + (maxY === minY ? 0 : (yr - minY) / (maxY - minY)) * (W - padL - padR);
       const sy = (c) => H - padB - (c / maxC) * (H - padT - padB);
-
       const pts = data.map((d) => [sx(d.year), sy(d.studyCount)]);
       const linePath = 'M ' + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' L ');
       const areaPath = `M ${pts[0][0].toFixed(1)},${H - padB} L ` + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' L ') + ` L ${pts[pts.length - 1][0].toFixed(1)},${H - padB} Z`;
-
       const yTickCount = Math.min(4, maxC);
       const yTicks = [];
       for (let i = 0; i <= yTickCount; i++) yTicks.push(Math.round((maxC / yTickCount) * i));
-
       const span = maxY - minY;
       const labelStep = Math.max(1, Math.ceil((span + 1) / 8));
       const xLabels = [];
       for (let yr = minY; yr <= maxY; yr += labelStep) xLabels.push(yr);
       if (xLabels[xLabels.length - 1] !== maxY) xLabels.push(maxY);
-
       return (
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block' }}>
           <defs>
@@ -641,7 +715,7 @@ Return ONLY a JSON object with this exact structure:
               <stop offset="100%" stopColor="#0EA5E9" stopOpacity="0.02" />
             </linearGradient>
           </defs>
-          {Array.from(new Set(yTicks)).map((t, i) => {
+          {uniq(yTicks).map((t, i) => {
             const y = sy(t);
             return (
               <g key={i}>
@@ -665,6 +739,112 @@ Return ONLY a JSON object with this exact structure:
     }
 
     /* ============================================================
+       EVIDENCE PYRAMID — study-type composition (from PubMed tags)
+    ============================================================ */
+    function EvidencePyramid({ typeCounts }) {
+      const tiers = EVIDENCE_TIERS.map((t) => ({ ...t, count: (typeCounts && typeCounts[t.key]) || 0 })).filter((t) => t.count > 0);
+      if (tiers.length === 0) return null;
+      const max = Math.max(...tiers.map((t) => t.count));
+      return (
+        <div className="space-y-2">
+          {tiers.map((t) => {
+            const pct = 34 + 66 * (t.count / max);
+            return (
+              <div key={t.key} className="flex items-center justify-center">
+                <div className="rounded-lg flex items-center justify-between px-4 text-white shadow-card"
+                  style={{ width: pct + '%', background: t.color, height: 38, minWidth: 200 }}>
+                  <span className="text-xs sm:text-sm font-medium truncate">{t.label}</span>
+                  <span className="font-num text-sm font-bold ml-3">{t.count}</span>
+                </div>
+              </div>
+            );
+          })}
+          <p className="text-xs text-sub text-center mt-3">
+            Publication types among {Object.values(typeCounts || {}).reduce((a, b) => a + b, 0)} retrieved studies, tagged by PubMed. Strongest evidence on top.
+          </p>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       TRIAL STATUS DONUT
+    ============================================================ */
+    function statusBucket(s) {
+      const u = String(s || '').toUpperCase();
+      if (u.includes('RECRUIT') || u.includes('ENROLL')) return 'Recruiting';
+      if (u.includes('ACTIVE')) return 'Active';
+      if (u.includes('COMPLETED')) return 'Completed';
+      if (u.includes('TERMINATED') || u.includes('WITHDRAWN') || u.includes('SUSPENDED')) return 'Stopped';
+      return 'Other';
+    }
+    const STATUS_COLORS = { Recruiting: '#059669', Active: '#0EA5E9', Completed: '#1E40AF', Stopped: '#DC2626', Other: '#94A3B8' };
+
+    function TrialStatusDonut({ trials }) {
+      const counts = {};
+      trials.forEach((t) => { const b = statusBucket(t.status); counts[b] = (counts[b] || 0) + 1; });
+      const segments = Object.keys(counts).map((k) => ({ label: k, value: counts[k], color: STATUS_COLORS[k] }))
+        .sort((a, b) => b.value - a.value);
+      const total = segments.reduce((a, s) => a + s.value, 0);
+      if (total === 0) return <p className="text-sm text-sub italic">No trial status data.</p>;
+      const size = 168, thickness = 24, r = (size - thickness) / 2, c = size / 2, circ = 2 * Math.PI * r;
+      let offset = 0;
+      return (
+        <div className="flex items-center gap-5 flex-wrap">
+          <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} style={{ flexShrink: 0 }}>
+            <circle cx={c} cy={c} r={r} fill="none" stroke="#F1F5F9" strokeWidth={thickness} />
+            {segments.map((s, i) => {
+              const len = (s.value / total) * circ;
+              const el = (
+                <circle key={i} cx={c} cy={c} r={r} fill="none" stroke={s.color} strokeWidth={thickness}
+                  strokeDasharray={`${len} ${circ - len}`} strokeDashoffset={-offset}
+                  transform={`rotate(-90 ${c} ${c})`} />
+              );
+              offset += len;
+              return el;
+            })}
+            <text x={c} y={c - 4} textAnchor="middle" fontSize="26" fontWeight="700" fill="#0F172A" fontFamily="'JetBrains Mono', monospace">{total}</text>
+            <text x={c} y={c + 16} textAnchor="middle" fontSize="11" fill="#475569">trials shown</text>
+          </svg>
+          <div className="space-y-1.5">
+            {segments.map((s, i) => (
+              <div key={i} className="flex items-center gap-2 text-sm">
+                <span className="w-3 h-3 rounded-sm" style={{ background: s.color }}></span>
+                <span className="text-ink">{s.label}</span>
+                <span className="font-num text-sub">{s.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       ENROLLMENT BY TRIAL — horizontal bars
+    ============================================================ */
+    function EnrollmentBar({ trials }) {
+      const rows = trials.filter((t) => t.enrollment && t.enrollment > 0)
+        .sort((a, b) => b.enrollment - a.enrollment).slice(0, 8);
+      if (rows.length === 0) return <p className="text-sm text-sub italic">No enrollment figures reported.</p>;
+      const max = rows[0].enrollment;
+      return (
+        <div className="space-y-2.5">
+          {rows.map((t) => (
+            <div key={t.nctId}>
+              <div className="flex items-center justify-between text-xs mb-1">
+                <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline truncate max-w-[70%]">{t.title}</a>
+                <span className="font-num text-sub">{fmtInt(t.enrollment)}</span>
+              </div>
+              <div className="h-2.5 rounded-full bg-slate-100 overflow-hidden">
+                <div className="h-full rounded-full" style={{ width: Math.max(4, (t.enrollment / max) * 100) + '%', background: '#1E40AF' }}></div>
+              </div>
+            </div>
+          ))}
+          <p className="text-xs text-sub mt-2">Top trials by reported enrollment — a sense of the scale of evidence.</p>
+        </div>
+      );
+    }
+
+    /* ============================================================
        TRIAL PIPELINE
     ============================================================ */
     function PhaseColumn({ title, count, summary, accent }) {
@@ -682,14 +862,7 @@ Return ONLY a JSON object with this exact structure:
       );
     }
 
-    function TrialPipeline({ trials, outcomesByPhase }) {
-      const obp = outcomesByPhase || {};
-      const counts = trials.reduce((acc, t) => { acc[t.bucket] = (acc[t.bucket] || 0) + 1; return acc; }, {});
-      const pick = (a, b) => (a != null ? a : (b != null ? b : 0));
-      const p12 = pick(obp.phase1_2 && obp.phase1_2.trialCount, counts.phase1_2);
-      const p3 = pick(obp.phase3 && obp.phase3.trialCount, counts.phase3);
-      const appr = pick(obp.approved && obp.approved.count, counts.approved);
-
+    function TrialTable({ trials }) {
       const statusColor = (s) => {
         const u = String(s || '').toUpperCase();
         if (u.includes('RECRUIT')) return 'text-strong bg-emerald-50';
@@ -699,49 +872,56 @@ Return ONLY a JSON object with this exact structure:
         return 'text-sub bg-slate-100';
       };
       const pretty = (s) => String(s || '').replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-
+      if (trials.length === 0) return null;
       return (
-        <div>
-          <div className="flex flex-col sm:flex-row gap-3">
-            <PhaseColumn title="Phase 1 / 2" count={p12} summary={obp.phase1_2 && obp.phase1_2.summary} accent="#0EA5E9" />
-            <PhaseColumn title="Phase 3" count={p3} summary={obp.phase3 && obp.phase3.summary} accent="#1E40AF" />
-            <PhaseColumn title="Phase 4 / Approved" count={appr} summary={obp.approved && obp.approved.summary} accent="#059669" />
-          </div>
-          {trials.length > 0 && (
-            <div className="mt-5 overflow-x-auto rounded-xl border border-edge">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-slate-50 text-left text-xs uppercase tracking-wide text-sub">
-                    <th className="px-4 py-3 font-semibold">Trial</th>
-                    <th className="px-4 py-3 font-semibold whitespace-nowrap">Phase</th>
-                    <th className="px-4 py-3 font-semibold whitespace-nowrap">Status</th>
-                    <th className="px-4 py-3 font-semibold whitespace-nowrap text-right">Enrollment</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {trials.slice(0, 12).map((t) => (
-                    <tr key={t.nctId} className="border-t border-edge hover:bg-slate-50/60">
-                      <td className="px-4 py-3 max-w-md">
-                        <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
-                          <span className="line-clamp-2">{t.title}</span>
-                        </a>
-                        <div className="font-num text-[11px] text-slate-400 mt-0.5">{t.nctId}</div>
-                      </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sub">{t.phase}</td>
-                      <td className="px-4 py-3 whitespace-nowrap"><span className={`px-2 py-0.5 rounded text-[11px] font-medium ${statusColor(t.status)}`}>{pretty(t.status)}</span></td>
-                      <td className="px-4 py-3 whitespace-nowrap text-right font-num text-sub">{fmtInt(t.enrollment)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+        <div className="overflow-x-auto rounded-xl border border-edge">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-slate-50 text-left text-xs uppercase tracking-wide text-sub">
+                <th className="px-4 py-3 font-semibold">Trial</th>
+                <th className="px-4 py-3 font-semibold whitespace-nowrap">Phase</th>
+                <th className="px-4 py-3 font-semibold whitespace-nowrap">Status</th>
+                <th className="px-4 py-3 font-semibold whitespace-nowrap text-right">Enrollment</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trials.slice(0, 12).map((t) => (
+                <tr key={t.nctId} className="border-t border-edge hover:bg-slate-50/60">
+                  <td className="px-4 py-3 max-w-md">
+                    <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                      <span className="line-clamp-2">{t.title}</span>
+                    </a>
+                    <div className="font-num text-[11px] text-slate-400 mt-0.5">{t.nctId}</div>
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap text-sub">{t.phase}</td>
+                  <td className="px-4 py-3 whitespace-nowrap"><span className={`px-2 py-0.5 rounded text-[11px] font-medium ${statusColor(t.status)}`}>{pretty(t.status)}</span></td>
+                  <td className="px-4 py-3 whitespace-nowrap text-right font-num text-sub">{fmtInt(t.enrollment)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function PhaseRow({ trials, outcomesByPhase }) {
+      const obp = outcomesByPhase || {};
+      const counts = trials.reduce((acc, t) => { acc[t.bucket] = (acc[t.bucket] || 0) + 1; return acc; }, {});
+      const pick = (a, b) => (a != null ? a : (b != null ? b : 0));
+      const p12 = pick(obp.phase1_2 && obp.phase1_2.trialCount, counts.phase1_2);
+      const p3 = pick(obp.phase3 && obp.phase3.trialCount, counts.phase3);
+      const appr = pick(obp.approved && obp.approved.count, counts.approved);
+      return (
+        <div className="flex flex-col sm:flex-row gap-3">
+          <PhaseColumn title="Phase 1 / 2" count={p12} summary={obp.phase1_2 && obp.phase1_2.summary} accent="#0EA5E9" />
+          <PhaseColumn title="Phase 3" count={p3} summary={obp.phase3 && obp.phase3.summary} accent="#1E40AF" />
+          <PhaseColumn title="Phase 4 / Approved" count={appr} summary={obp.approved && obp.approved.summary} accent="#059669" />
         </div>
       );
     }
 
     /* ============================================================
-       PATIENT / RESEARCHER PANEL
+       PATIENT / RESEARCHER + KNOWLEDGE GAPS
     ============================================================ */
     function ListBlock({ items, color }) {
       if (!items || items.length === 0) return <p className="text-sm text-sub italic">No specific points were generated.</p>;
@@ -777,18 +957,18 @@ Return ONLY a JSON object with this exact structure:
       );
     }
 
-    /* ============================================================
-       KNOWLEDGE GAPS
-    ============================================================ */
-    function KnowledgeGaps({ gaps }) {
+    function KnowledgeGaps({ gaps, highlight }) {
       if (!gaps || gaps.length === 0) return null;
       return (
-        <div className="bg-white rounded-xl border border-edge shadow-card p-6">
-          <h3 className="font-display text-lg text-ink mb-1">What we still don't know</h3>
-          <p className="text-sm text-sub mb-4">Areas where the published evidence is thin or missing — useful for advocates and researchers.</p>
+        <div className={`rounded-xl border shadow-card p-6 ${highlight ? 'border-amber-200 bg-amber-50/60' : 'border-edge bg-white'}`}>
+          <div className="flex items-center gap-2 mb-1">
+            {highlight && <span className="text-warning"><Icon name="gap" className="w-5 h-5" /></span>}
+            <h3 className="font-display text-lg text-ink">What we still don't know</h3>
+          </div>
+          <p className="text-sm text-sub mb-4">Where the published evidence is thin or missing — often the most useful section for advocates pushing for research.</p>
           <div className="grid sm:grid-cols-2 gap-3">
             {gaps.map((g, i) => (
-              <div key={i} className="flex items-start gap-3 rounded-lg bg-slate-50 border border-edge px-4 py-3">
+              <div key={i} className="flex items-start gap-3 rounded-lg bg-white border border-edge px-4 py-3">
                 <span className="font-num text-xs text-slate-400 mt-0.5">{String(i + 1).padStart(2, '0')}</span>
                 <span className="text-sm text-ink leading-relaxed">{g}</span>
               </div>
@@ -820,14 +1000,14 @@ Return ONLY a JSON object with this exact structure:
             </div>
             <div className="grid lg:grid-cols-2 gap-6">
               <div>
-                <h4 className="text-sm font-semibold text-ink mb-3 flex items-center gap-2"><Icon name="book" className="w-4 h-4 text-primary" /> PubMed papers ({papers.length})</h4>
+                <h4 className="text-sm font-semibold text-ink mb-3 flex items-center gap-2"><Icon name="book" className="w-4 h-4 text-primary" /> PubMed papers ({papers.length}, ranked by study quality)</h4>
                 <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
                   {papers.length === 0 && <p className="text-sm text-sub italic">No PubMed records returned.</p>}
-                  {papers.map((p) => (
-                    <div key={p.pmid} className="text-sm border-l-2 border-edge pl-3">
+                  {papers.slice(0, 60).map((p) => (
+                    <div key={p.pmid} className="text-sm border-l-2 pl-3" style={{ borderColor: TIER[p.category] ? TIER[p.category].color : '#E2E8F0' }}>
                       <a href={`https://pubmed.ncbi.nlm.nih.gov/${p.pmid}/`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline font-medium">{p.title}</a>
                       <div className="text-xs text-sub mt-0.5">{p.authors && <span>{p.authors} · </span>}<span className="italic">{p.journal}</span>{p.year ? ` · ${p.year}` : ''}</div>
-                      <div className="font-num text-[11px] text-slate-400 mt-0.5">PMID {p.pmid}</div>
+                      <div className="font-num text-[11px] text-slate-400 mt-0.5">PMID {p.pmid}{p.category ? ` · ${TIER[p.category].label}` : ''}</div>
                     </div>
                   ))}
                 </div>
@@ -863,7 +1043,39 @@ Return ONLY a JSON object with this exact structure:
     }
 
     /* ============================================================
-       DISCLAIMER
+       ADVERSE EVENTS BAR (OpenFDA)
+    ============================================================ */
+    function AdverseEventBar({ fda }) {
+      if (!fda || !fda.topReactions || fda.topReactions.length === 0) return null;
+      const rows = fda.topReactions.slice(0, 10);
+      const max = Math.max(...rows.map((r) => r.count));
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+          <h3 className="font-display text-lg text-ink mb-1">Reported adverse events — {fda.drug}</h3>
+          <p className="text-sm text-sub mb-4">
+            Most-reported reactions across {fmtInt(fda.totalReports)} OpenFDA (FAERS) reports
+            {fda.seriousCount != null ? `, ${fmtInt(fda.seriousCount)} flagged serious` : ''}.
+            <span className="text-warning"> These are voluntary reports — counts reflect reporting frequency, not incidence or causation.</span>
+          </p>
+          <div className="space-y-2.5">
+            {rows.map((r, i) => (
+              <div key={i}>
+                <div className="flex items-center justify-between text-xs mb-1">
+                  <span className="text-ink capitalize">{String(r.term || '').toLowerCase()}</span>
+                  <span className="font-num text-sub">{fmtInt(r.count)}</span>
+                </div>
+                <div className="h-2.5 rounded-full bg-slate-100 overflow-hidden">
+                  <div className="h-full rounded-full" style={{ width: Math.max(4, (r.count / max) * 100) + '%', background: '#D97706' }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       DISCLAIMER / ERROR / ABOUT / SECTION
     ============================================================ */
     function Disclaimer({ text, limitations }) {
       return (
@@ -882,9 +1094,6 @@ Return ONLY a JSON object with this exact structure:
       );
     }
 
-    /* ============================================================
-       ERROR / NO-DATA STATES
-    ============================================================ */
     function ErrorState({ title, message, onRetry, suggestions, onPick }) {
       return (
         <div className="max-w-2xl mx-auto mt-10 bg-white rounded-2xl border border-edge shadow-card p-8 text-center fade-up">
@@ -903,9 +1112,6 @@ Return ONLY a JSON object with this exact structure:
       );
     }
 
-    /* ============================================================
-       ABOUT
-    ============================================================ */
     function About() {
       return (
         <details className="bg-white rounded-xl border border-edge shadow-card overflow-hidden group">
@@ -914,16 +1120,16 @@ Return ONLY a JSON object with this exact structure:
             <Icon name="chevron" className="w-5 h-5 text-sub transition-transform group-open:rotate-180" />
           </summary>
           <div className="px-6 pb-6 border-t border-edge pt-5 text-sm text-sub leading-relaxed space-y-3">
-            <p>ClinicalLens queries public biomedical databases live and uses Claude to synthesize the results into a sourced, plain-language statistical summary. It works for <span className="font-medium text-ink">any</span> drug, disease, condition, or treatment — it is a general-purpose evidence search tool.</p>
+            <p>ClinicalLens queries public biomedical databases live and uses Claude to synthesize the results into a sourced, plain-language statistical summary. It works for <span className="font-medium text-ink">any</span> drug, disease, condition, or treatment — and can compare two treatments side by side.</p>
             <div>
               <span className="font-semibold text-ink">Data sources (all free, public APIs):</span>
               <ul className="list-disc ml-5 mt-1 space-y-1">
-                <li><span className="font-medium text-ink">PubMed</span> via NCBI E-utilities — peer-reviewed literature.</li>
+                <li><span className="font-medium text-ink">PubMed</span> via NCBI E-utilities — up to 200 records, ranked by study quality (systematic reviews & RCTs first), not just recency.</li>
                 <li><span className="font-medium text-ink">ClinicalTrials.gov</span> (v2 API) — registered trials.</li>
-                <li><span className="font-medium text-ink">OpenFDA</span> (FAERS) — post-market adverse-event reports for named drugs.</li>
+                <li><span className="font-medium text-ink">OpenFDA</span> (FAERS) — post-market adverse-event reports, searched across generic, brand, and substance names.</li>
               </ul>
             </div>
-            <p><span className="font-semibold text-ink">Accuracy guardrails:</span> The synthesis model is instructed to cite only PMIDs and NCT numbers present in the retrieved data, never to invent statistics, to always show study quality and sample size, and to communicate uncertainty using ranges. Every number on this page links back to its source. Publication-timeline counts are computed directly from the returned records.</p>
+            <p><span className="font-semibold text-ink">Accuracy guardrails:</span> Every chart is computed directly from retrieved data, never inferred. The synthesis model cites only PMIDs and NCT numbers present in the retrieved data, never invents statistics, and always shows study quality and sample size. The evidence pyramid uses PubMed's own publication-type tags; timeline counts are computed from the returned records.</p>
             <p><span className="font-semibold text-ink">Privacy &amp; keys:</span> Claude requests are proxied through a small serverless backend, so the Anthropic API key stays on the server and is never exposed to your browser.</p>
             <p className="text-xs text-slate-400">ClinicalLens is an informational tool and is not a substitute for professional medical advice.</p>
           </div>
@@ -943,14 +1149,26 @@ Return ONLY a JSON object with this exact structure:
       );
     }
 
+    function Card({ title, icon, children }) {
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+          <h3 className="font-display text-lg text-ink mb-4 flex items-center gap-2">{icon && <Icon name={icon} className="w-5 h-5 text-primary" />}{title}</h3>
+          {children}
+        </div>
+      );
+    }
+
     /* ============================================================
-       RESULTS DASHBOARD
+       SINGLE-TOPIC DASHBOARD
     ============================================================ */
-    function Dashboard({ query, synthesis, raw }) {
+    function Dashboard({ query, synthesis, raw, sortMode, onSort, onBroaden }) {
       const timeline = (synthesis.timelineData && synthesis.timelineData.length >= 2) ? synthesis.timelineData : raw.computedTimeline;
+      const allOneYear = raw.pubmed.papers.length > 0 && uniq(raw.pubmed.papers.map((p) => p.year).filter(Boolean)).length <= 1;
       const stats = synthesis.keyStatistics || [];
+      const trials = raw.trials.studies;
       return (
         <div className="space-y-10 mt-8">
+          {/* Header */}
           <section className="fade-up">
             <div className="flex items-start justify-between gap-4 flex-wrap">
               <div>
@@ -971,27 +1189,56 @@ Return ONLY a JSON object with this exact structure:
               <StatCard label="Clinical Trials" value={fmtInt(synthesis.totalTrialsFound != null ? synthesis.totalTrialsFound : raw.trials.count)} icon="flask" />
               <StatCard label="Est. Patients Studied" value={fmtInt(synthesis.totalPatientsAcrossStudies)} icon="users" />
             </div>
+            <div className="mt-4 flex items-center gap-2 text-xs text-sub">
+              <span>Ranking:</span>
+              <div className="inline-flex rounded-lg border border-edge overflow-hidden">
+                <button onClick={() => onSort('relevance')} className={`px-3 py-1.5 font-medium ${sortMode === 'relevance' ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Best match</button>
+                <button onClick={() => onSort('date')} className={`px-3 py-1.5 font-medium ${sortMode === 'date' ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Most recent</button>
+              </div>
+              <span className="text-slate-400">— "Best match" reduces recency bias by surfacing foundational studies too.</span>
+            </div>
           </section>
 
+          {/* What we still don't know — promoted to the top */}
+          <KnowledgeGaps gaps={synthesis.knowledgeGaps} highlight />
+
+          {/* Key statistics */}
           {stats.length > 0 && (
             <Section title="Key statistics" subtitle="Each figure is traceable to its source. The left border signals study quality at a glance." icon="search">
               <div className="grid md:grid-cols-2 gap-5">{stats.map((s, i) => <KeyStatisticCard key={i} stat={s} />)}</div>
             </Section>
           )}
 
+          {/* Evidence quality mix */}
+          {Object.keys(raw.pubmed.typeCounts || {}).length > 0 && (
+            <Section title="Evidence quality mix" subtitle="What kinds of studies make up this evidence base — a quick read on how strong the literature is." icon="layers">
+              <div className="bg-white rounded-xl border border-edge shadow-card p-6"><EvidencePyramid typeCounts={raw.pubmed.typeCounts} /></div>
+            </Section>
+          )}
+
+          {/* Research timeline */}
           <Section title="Research timeline" subtitle="Publications per year — shows whether research interest is growing or flat.">
-            <div className="bg-white rounded-xl border border-edge shadow-card p-5"><ResearchTimeline data={timeline} /></div>
+            <div className="bg-white rounded-xl border border-edge shadow-card p-5"><ResearchTimeline data={timeline} allOneYear={allOneYear} onBroaden={onBroaden} /></div>
           </Section>
 
-          <Section title="Clinical trial pipeline" subtitle="Phase breakdown and the registered trials behind it." icon="flask">
-            <TrialPipeline trials={raw.trials.studies} outcomesByPhase={synthesis.outcomesByPhase} />
+          {/* Clinical trial landscape */}
+          <Section title="Clinical trial landscape" subtitle="Status, scale, and phase of the registered trials behind this evidence." icon="flask">
+            <div className="grid md:grid-cols-2 gap-5 mb-5">
+              <Card title="Trial status"><TrialStatusDonut trials={trials} /></Card>
+              <Card title="Enrollment by trial" icon="bars"><EnrollmentBar trials={trials} /></Card>
+            </div>
+            <PhaseRow trials={trials} outcomesByPhase={synthesis.outcomesByPhase} />
+            <div className="mt-5"><TrialTable trials={trials} /></div>
           </Section>
 
+          {/* Adverse events */}
+          <AdverseEventBar fda={raw.fda} />
+
+          {/* Two perspectives */}
           <Section title="Two perspectives">
             <PatientResearcherPanel patient={synthesis.patientConsiderations} researcher={synthesis.researcherNotes} />
           </Section>
 
-          <KnowledgeGaps gaps={synthesis.knowledgeGaps} />
           <Disclaimer text={synthesis.disclaimer} limitations={synthesis.dataLimitations} />
           <SourcesPanel papers={raw.pubmed.papers} trials={raw.trials.studies} fetchedAt={raw.fetchedAt} fda={raw.fda} />
           <About />
@@ -1000,38 +1247,127 @@ Return ONLY a JSON object with this exact structure:
     }
 
     /* ============================================================
+       COMPARISON DASHBOARD
+    ============================================================ */
+    function ComparisonColumn({ arm }) {
+      const { parsed, synthesis, raw } = arm;
+      const trials = raw.trials.studies;
+      const stats = (synthesis.keyStatistics || []).slice(0, 5);
+      return (
+        <div className="space-y-5">
+          <div className="bg-white rounded-xl border border-edge shadow-card p-5">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <h3 className="font-display text-2xl text-ink capitalize">{labelOf(parsed)}</h3>
+              <EvidenceBadge strength={synthesis.evidenceStrength} />
+            </div>
+            <p className="text-sm text-ink leading-relaxed mt-3">{synthesis.toplineSummary}</p>
+            <div className="grid grid-cols-3 gap-2 mt-4">
+              {[['Studies', synthesis.totalStudiesFound != null ? synthesis.totalStudiesFound : raw.pubmed.totalAvailable],
+                ['Trials', synthesis.totalTrialsFound != null ? synthesis.totalTrialsFound : raw.trials.count],
+                ['Patients', synthesis.totalPatientsAcrossStudies]].map(([l, v], i) => (
+                <div key={i} className="rounded-lg bg-slate-50 border border-edge px-3 py-2 text-center">
+                  <div className="font-num text-lg font-bold text-ink">{fmtInt(v)}</div>
+                  <div className="text-[11px] text-sub">{l}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {stats.length > 0 && <div className="space-y-4">{stats.map((s, i) => <KeyStatisticCard key={i} stat={s} />)}</div>}
+
+          {Object.keys(raw.pubmed.typeCounts || {}).length > 0 && (
+            <Card title="Evidence quality mix" icon="layers"><EvidencePyramid typeCounts={raw.pubmed.typeCounts} /></Card>
+          )}
+
+          <Card title="Trial status"><TrialStatusDonut trials={trials} /></Card>
+
+          {(synthesis.knowledgeGaps || []).length > 0 && (
+            <Card title="What we still don't know" icon="gap">
+              <ListBlock items={(synthesis.knowledgeGaps || []).slice(0, 5)} color="#D97706" />
+            </Card>
+          )}
+
+          <AdverseEventBar fda={raw.fda} />
+          <SourcesPanel papers={raw.pubmed.papers} trials={raw.trials.studies} fetchedAt={raw.fetchedAt} fda={raw.fda} />
+        </div>
+      );
+    }
+
+    function ComparisonDashboard({ query, arms }) {
+      const a = arms[0], b = arms[1];
+      return (
+        <div className="space-y-8 mt-8">
+          <section className="fade-up">
+            <div className="text-xs font-medium uppercase tracking-wide text-sub mb-1 flex items-center gap-2"><Icon name="scale" className="w-4 h-4" /> Side-by-side evidence comparison</div>
+            <h1 className="font-display text-3xl sm:text-4xl text-ink leading-tight capitalize">{labelOf(a.parsed)} <span className="text-sub font-sans text-2xl">vs</span> {labelOf(b.parsed)}</h1>
+            <p className="text-sm text-sub mt-2">Each side is synthesized independently from its own live PubMed / ClinicalTrials.gov / OpenFDA pull. Compare like-for-like — sample sizes and study designs differ between arms.</p>
+          </section>
+          <div className="grid lg:grid-cols-2 gap-6 items-start">
+            <ComparisonColumn arm={a} />
+            <ComparisonColumn arm={b} />
+          </div>
+          <Disclaimer />
+          <About />
+        </div>
+      );
+    }
+
+    /* ============================================================
        APP
     ============================================================ */
-    const INITIAL_STEPS = [
+    const SINGLE_STEPS = [
       { label: 'Parsing your query with AI', status: 'pending', detail: '' },
-      { label: 'Searching PubMed', status: 'pending', detail: '' },
+      { label: 'Searching PubMed (ranking by study quality)', status: 'pending', detail: '' },
       { label: 'Searching ClinicalTrials.gov & OpenFDA', status: 'pending', detail: '' },
       { label: 'Running statistical synthesis', status: 'pending', detail: '' },
     ];
 
     function App() {
-      const [phase, setPhase] = useState('idle'); // idle | loading | done | nodata | error
-      const [steps, setSteps] = useState(INITIAL_STEPS);
+      const [phase, setPhase] = useState('idle'); // idle | loading | done | compare | nodata | error
+      const [steps, setSteps] = useState(SINGLE_STEPS);
       const [result, setResult] = useState(null);
       const [error, setError] = useState(null);
       const [query, setQuery] = useState('');
+      const [sortMode, setSortMode] = useState('relevance');
       const lastQuery = useRef('');
 
       const updateStep = useCallback((idx, status, detail) => {
         setSteps((prev) => prev.map((s, i) => i === idx ? { ...s, status, detail: detail !== undefined ? detail : s.detail } : s));
       }, []);
 
-      const runSearch = useCallback(async (raw) => {
+      const runSearch = useCallback(async (raw, opts = {}) => {
+        const sort = opts.sort || 'relevance';
         lastQuery.current = raw;
-        setQuery(raw);
-        setError(null);
-        setResult(null);
-        setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'pending', detail: '' })));
+        setQuery(raw); setError(null); setResult(null);
+        setSortMode(sort);
         setPhase('loading');
 
         try {
+          setSteps(SINGLE_STEPS.map((s) => ({ ...s, status: 'pending', detail: '' })));
           updateStep(0, 'active');
           const parsed = await parseQuery(raw);
+          const isComparison = parsed && parsed.comparison && Array.isArray(parsed.arms) && parsed.arms.length >= 2 && parsed.arms.every((a) => a && a.condition);
+
+          if (isComparison) {
+            const a = parsed.arms[0], b = parsed.arms[1];
+            const la = labelOf(a), lb = labelOf(b);
+            setSteps([
+              { label: 'Parsing your comparison', status: 'done', detail: `${la} vs ${lb}` },
+              { label: `Researching & synthesizing ${la}`, status: 'active', detail: '' },
+              { label: `Researching & synthesizing ${lb}`, status: 'active', detail: '' },
+              { label: 'Building side-by-side comparison', status: 'pending', detail: '' },
+            ]);
+            const [resA, resB] = await Promise.all([
+              gather(a, sort).then((r) => { updateStep(1, 'done'); return r; }),
+              gather(b, sort).then((r) => { updateStep(2, 'done'); return r; }),
+            ]);
+            updateStep(3, 'active');
+            setResult({ comparison: true, query: raw, arms: [{ parsed: a, ...resA }, { parsed: b, ...resB }] });
+            updateStep(3, 'done');
+            setPhase('compare');
+            return;
+          }
+
           if (!parsed || !parsed.condition) {
             setPhase('error');
             setError({ title: 'Could not understand that query', message: 'Try naming a specific condition, drug, or treatment — for example a disease name or a medication.' });
@@ -1039,11 +1375,10 @@ Return ONLY a JSON object with this exact structure:
           }
           updateStep(0, 'done', parsed.condition + (parsed.drug ? ` · ${parsed.drug}` : ''));
 
-          updateStep(1, 'active');
-          updateStep(2, 'active');
-          const pubmedP = fetchPubMed(parsed)
-            .then((r) => { updateStep(1, 'done', `${fmtInt(r.totalAvailable)} studies found`); return r; })
-            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '' }; });
+          updateStep(1, 'active'); updateStep(2, 'active');
+          const pubmedP = fetchPubMed(parsed, sort)
+            .then((r) => { updateStep(1, 'done', `${fmtInt(r.totalAvailable)} studies, ranked by quality`); return r; })
+            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} }; });
           const trialsP = fetchTrials(parsed).catch(() => ({ studies: [], count: 0 }));
           const fdaP = fetchFDA(parsed).catch(() => null);
 
@@ -1067,8 +1402,10 @@ Return ONLY a JSON object with this exact structure:
         }
       }, [updateStep]);
 
+      const onSort = useCallback((mode) => { if (mode !== sortMode && lastQuery.current) runSearch(lastQuery.current, { sort: mode }); }, [sortMode, runSearch]);
+
       const busy = phase === 'loading';
-      const showHero = phase !== 'done';
+      const showHero = phase !== 'done' && phase !== 'compare';
 
       return (
         <div className="min-h-screen">
@@ -1088,7 +1425,7 @@ Return ONLY a JSON object with this exact structure:
                 {phase === 'idle' && (
                   <div className="text-center mb-8 fade-up">
                     <h1 className="font-display text-4xl sm:text-5xl text-ink leading-tight">A clearer lens on clinical evidence</h1>
-                    <p className="text-base sm:text-lg text-sub mt-4 max-w-2xl mx-auto leading-relaxed">Type any condition, drug, or treatment. ClinicalLens pulls live data from PubMed, ClinicalTrials.gov, and OpenFDA, then synthesizes a sourced, statistically honest summary — every number traceable to its source.</p>
+                    <p className="text-base sm:text-lg text-sub mt-4 max-w-2xl mx-auto leading-relaxed">Type any condition, drug, or treatment — or compare two with "A vs B". ClinicalLens pulls live data from PubMed, ClinicalTrials.gov, and OpenFDA, ranks it by study quality, and synthesizes a sourced, statistically honest summary.</p>
                   </div>
                 )}
                 <div className="max-w-3xl mx-auto"><SearchBar onSearch={runSearch} busy={busy} /></div>
@@ -1103,7 +1440,8 @@ Return ONLY a JSON object with this exact structure:
                 message="We found little or no indexed evidence for that query. This may mean it is very rare, newly emerging, or primarily researched in non-English literature. Try a broader term or one of these:"
                 suggestions={EXAMPLE_CHIPS} onPick={runSearch} />
             )}
-            {phase === 'done' && result && <Dashboard query={query} synthesis={result.synthesis} raw={result.raw} />}
+            {phase === 'done' && result && <Dashboard query={query} synthesis={result.synthesis} raw={result.raw} sortMode={sortMode} onSort={onSort} onBroaden={() => onSort('date')} />}
+            {phase === 'compare' && result && <ComparisonDashboard query={result.query} arms={result.arms} />}
             {phase === 'idle' && <div className="max-w-3xl mx-auto mt-16"><About /></div>}
           </main>
 

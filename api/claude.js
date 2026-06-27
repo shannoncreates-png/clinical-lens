@@ -6,6 +6,8 @@
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-4-6';
+// Models the frontend may request (parse uses Haiku, synthesis uses Sonnet).
+const ALLOWED_MODELS = new Set(['claude-sonnet-4-6', 'claude-haiku-4-5']);
 
 // Allow the synthesis call up to 60s. Vercel's default function timeout is 10s,
 // which can cut off a long generation; 60s is the max on the Hobby plan.
@@ -33,6 +35,7 @@ export default async function handler(req, res) {
   let body = req.body;
   if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
   const { system, messages, max_tokens } = body || {};
+  const model = ALLOWED_MODELS.has(body && body.model) ? body.model : MODEL;
 
   if (!system || !Array.isArray(messages) || messages.length === 0) {
     res.status(400).json({ error: { message: 'Request must include "system" and a non-empty "messages" array.' } });
@@ -48,7 +51,7 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         // Sonnet 4.6 supports up to 64K output; cap at 16K which is plenty here.
         max_tokens: Math.min(Math.max(parseInt(max_tokens, 10) || 4096, 256), 16000),
         system,

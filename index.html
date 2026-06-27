@@ -164,9 +164,10 @@
     /* ============================================================
        ANTHROPIC CALL (via serverless proxy — no key in the browser)
     ============================================================ */
-    async function callClaude(system, userContent, { maxTokens = 4096, prefill = '{' } = {}) {
-      const messages = [{ role: 'user', content: userContent }];
-      if (prefill) messages.push({ role: 'assistant', content: prefill });
+    async function callClaude(system, userContent, { maxTokens = 4096 } = {}) {
+      // NOTE: no assistant-message prefill — the conversation must end with a
+      // user message. We instruct the model to return only JSON and parse it.
+      const messages = [{ role: 'user', content: userContent + '\n\nRespond with only the raw JSON object — no markdown fences, no commentary.' }];
 
       let res;
       try {
@@ -192,7 +193,7 @@
       const data = await res.json();
       if (data && data.error) throw new Error(data.error.message || String(data.error));
       const text = (data.content || []).map((c) => c.text || '').join('');
-      return extractJSON((prefill || '') + text);
+      return extractJSON(text);
     }
 
     /* ============================================================

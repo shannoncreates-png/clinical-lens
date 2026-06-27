@@ -67,7 +67,7 @@ async function handleClaude(req, res) {
     const upstream = await fetch(ANTHROPIC_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: MODEL, max_tokens: Math.min(Math.max(parseInt(max_tokens, 10) || 4096, 256), 8000), system, messages }),
+      body: JSON.stringify({ model: MODEL, max_tokens: Math.min(Math.max(parseInt(max_tokens, 10) || 4096, 256), 16000), system, messages }),
     });
     const text = await upstream.text();
     res.writeHead(upstream.status, { 'content-type': 'application/json' });

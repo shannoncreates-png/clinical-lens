@@ -192,6 +192,9 @@
 
       const data = await res.json();
       if (data && data.error) throw new Error(data.error.message || String(data.error));
+      if (data && data.stop_reason === 'max_tokens') {
+        throw new Error('The AI response was too long and got cut off. Try a more specific query (e.g. add a drug name).');
+      }
       const text = (data.content || []).map((c) => c.text || '').join('');
       return extractJSON(text);
     }
@@ -410,7 +413,7 @@ Return ONLY a JSON object with this exact structure:
           totalAvailableInPubMed: pm ? pm.totalAvailable : 0,
           returnedForAnalysis: pm ? pm.count : 0,
           papers: pm ? pm.papers.map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, type: p.pubtype })) : [],
-          abstractsTop10: pm ? (pm.abstracts || '').slice(0, 7000) : '',
+          abstractsTop10: pm ? (pm.abstracts || '').slice(0, 4500) : '',
         },
         clinicalTrials: {
           totalMatching: ct ? ct.count : 0,
@@ -427,9 +430,12 @@ Return ONLY a JSON object with this exact structure:
       const user = `Here is the raw data retrieved live from the source APIs. Produce the synthesis JSON. ` +
         `Cite only PMIDs and NCT numbers that appear in this data. Use the precomputedPublicationTimeline ` +
         `values for timelineData (counted directly from the returned PubMed records).\n\n` +
+        `Keep the JSON compact so it fits in the response: include the 6-8 most important keyStatistics ` +
+        `(not more), at most 8 activeTrials, at most 6 items in each list field, and keep every text field ` +
+        `to 1-2 sentences. Do not pad.\n\n` +
         '<raw_data>\n' + JSON.stringify(payload) + '\n</raw_data>';
 
-      return callClaude(SYNTH_SYSTEM, user, { maxTokens: 6000 });
+      return callClaude(SYNTH_SYSTEM, user, { maxTokens: 12000 });
     }
 
     /* ============================================================

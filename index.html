@@ -242,8 +242,14 @@ Each <armObject> has these fields:
   "outcomeType": "one of: treatment_outcomes, drug_efficacy, survival, remission, safety, general",
   "pubmedQuery": "optimized PubMed search string using boolean operators",
   "plainLanguageTopic": "what this is about in plain English",
-  "label": "short label, e.g. the drug or treatment name"
+  "label": "short label, e.g. the drug or treatment name",
+  "searchType": "disease | drug | combination | ambiguous",
+  "searchTypeConfidence": "high | medium | low",
+  "searchTypeRationale": "one sentence explaining the classification"
 }
+searchType rules: "disease" = a condition/syndrome/disorder/cancer/rare disease; "drug" = a medication
+(generic or brand) or a drug class; "combination" = the query names BOTH a drug AND a disease
+(e.g. "voclosporin FSGS"); "ambiguous" = a term that could be either and you cannot confidently tell.
 For comparisons, share the same condition across both arms and vary the drug/treatment.`;
 
     async function parseQuery(raw) {
@@ -487,6 +493,49 @@ Return ONLY a JSON object with this exact structure:
       return callClaude(SYNTH_SYSTEM, user, { maxTokens: 12000, model: MODEL_SYNTH });
     }
 
+    /* ============================================================
+       STEP 3b — SCIENTIFIC PROFILE (overview + treatment tiers / drug uses)
+       Runs in parallel with the statistical synthesis.
+    ============================================================ */
+    const PROFILE_SYSTEM = `You are a careful medical science communicator. Produce plain-language and technical
+explanations of a disease and/or drug, grounded in the retrieved literature and in well-established,
+non-controversial biomedical science. Return ONLY a JSON object containing the requested top-level blocks.
+
+GUARDRAILS:
+- Ground every claim. Use the retrieved data, or established science you are confident about. Where a
+  mechanism is contested or unknown, say so explicitly. Never fabricate.
+- If a field cannot be supported, write exactly: "The retrieved literature does not provide sufficient detail on this aspect."
+- Treatment tiers must reflect the retrieved data, not general knowledge alone. If a well-known first-line
+  treatment is absent from the retrieved studies, note: "Note: <treatment> is widely used clinically but did
+  not appear prominently in the retrieved literature sample — this may reflect the search scope."
+- Distinguish FDA-approved uses from off-label uses; never label an off-label use as FDA approved.
+- No promotional framing. Side effects and limitations get equal weight to benefits.
+- The "Plain" version must be just as accurate as the "Technical" one — only the vocabulary differs.
+- sourceIds must only contain PMID or NCT numbers that appear in the retrieved data.
+
+Block schemas (include only the blocks requested in the user message):
+"diseaseOverview": { "plainSummary": "3-4 sentences a smart non-scientist understands", "whatGoesWrong": "the core biological malfunction in high-school-biology terms", "mechanismDeep": "deeper mechanism (cell types, pathways, genetic/autoimmune basis, what's still unknown)", "whoGetsIt": "epidemiology in plain terms", "howDiagnosed": "tests/biomarkers/criteria; note diagnostic delay if relevant", "currentUnderstanding": "most current understanding; is the field evolving/contested?", "sourceIds": [] }
+"treatmentTiers": { "tierOne": { "label": "Most established in the evidence", "description": "...", "treatments": [ { "name": "", "mechanismBrief": "one sentence", "evidenceBasis": "study types supporting it", "typicalUse": "when/how used", "sourceIds": [], "caveat": "limitation or null" } ] }, "tierTwo": { "label": "Used in specific circumstances or second-line", "description": "...", "treatments": [ ...same... ] }, "tierThree": { "label": "Emerging, experimental, or less commonly used", "description": "...", "treatments": [ ...same... ] }, "tierRationale": "how tiers were assigned from the available evidence" }
+"drugOverview": { "plainSummary": "3-4 sentences a non-scientist understands", "mechanismOfAction": "what it binds/blocks/activates and the downstream effect, plain but accurate", "mechanismDeep": "receptor targets, pathway effects, pharmacodynamics, response variability", "pharmacokinetics": "how taken, onset, duration, clearance, key interactions/contraindications", "developmentContext": "what it was developed for, when approved, how use evolved", "currentUnderstanding": "recent findings on mechanism/safety/new applications", "sourceIds": [] }
+"drugUses": { "fdaApproved": [ { "indication": "", "approvalContext": "", "sourceIds": [] } ], "commonOffLabel": [ { "indication": "", "useContext": "", "evidenceLevel": "strong|moderate|limited|anecdotal", "sourceIds": [] } ], "underInvestigation": [ { "indication": "", "trialContext": "phase/how many trials/what is tested", "sourceIds": [] } ], "usesDisclaimer": "This list reflects uses documented in retrieved literature and may not be complete. FDA approval status should be verified at fda.gov." }`;
+
+    async function buildProfile(parsed, searchType, pm, ct, fda) {
+      const want = (searchType === 'disease') ? ['diseaseOverview', 'treatmentTiers']
+        : (searchType === 'drug') ? ['drugOverview', 'drugUses']
+        : ['drugOverview', 'drugUses', 'diseaseOverview', 'treatmentTiers'];
+      const payload = {
+        searchType, condition: parsed.condition, drug: parsed.drug, topic: parsed.plainLanguageTopic,
+        pubmed: pm ? pm.papers.slice(0, 40).map((p) => ({ pmid: p.pmid, title: p.title, year: p.year, studyType: p.category })) : [],
+        abstracts: pm ? (pm.abstracts || '').slice(0, 4000) : '',
+        trials: ct ? ct.studies.slice(0, 15).map((s) => ({ nctId: s.nctId, title: s.title, phase: s.phase, status: s.status })) : [],
+        openFDA: fda ? { drug: fda.drug, totalReports: fda.totalReports, topReactions: fda.topReactions.slice(0, 8) } : null,
+      };
+      const user = `Build the scientific profile. Return ONLY these top-level blocks: ${want.join(', ')}. ` +
+        `Keep each text field to 2-4 sentences, at most 4 treatments per tier, at most 6 items per drug-use category.\n\n` +
+        '<data>\n' + JSON.stringify(payload) + '\n</data>';
+      return callClaude(PROFILE_SYSTEM, user, { maxTokens: 12000, model: MODEL_SYNTH });
+    }
+
     // Full single-topic pipeline (used for comparison arms; the single-query path
     // below runs the same steps with granular progress).
     async function gather(parsed, sort) {
@@ -523,6 +572,8 @@ Return ONLY a JSON object with this exact structure:
         bars: <><path d="M3 3v18h18" /><rect x="7" y="11" width="3" height="6" /><rect x="12" y="7" width="3" height="10" /><rect x="17" y="13" width="3" height="4" /></>,
         gap: <><circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" /></>,
         scale: <><path d="m16 16 3-8 3 8c-2 1.5-4 1.5-6 0Z" /><path d="m2 16 3-8 3 8c-2 1.5-4 1.5-6 0Z" /><path d="M7 21h10" /><path d="M12 3v18" /><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" /></>,
+        dna: <><path d="M7 3c0 4 10 5 10 9s-10 5-10 9" /><path d="M17 3c0 4-10 5-10 9s10 5 10 9" /><path d="M8.5 6.5h7" /><path d="M8.5 17.5h7" /><path d="M9.5 9.5h5" /><path d="M9.5 14.5h5" /></>,
+        pill: <><path d="M10.5 20.5 3.5 13.5a5 5 0 0 1 7-7l7 7a5 5 0 0 1-7 7Z" /><path d="m8.5 8.5 7 7" /></>,
       };
       return (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -1159,9 +1210,210 @@ Return ONLY a JSON object with this exact structure:
     }
 
     /* ============================================================
+       SCIENTIFIC PROFILE COMPONENTS (disease / drug layouts)
+    ============================================================ */
+    const NO_DETAIL = 'The retrieved literature does not provide sufficient detail on this aspect.';
+
+    function SourceChips({ ids }) {
+      const list = uniq((ids || []).map((x) => String(x).trim()).filter(Boolean));
+      if (!list.length) return null;
+      return (
+        <div className="flex flex-wrap gap-2 mt-3">
+          {list.map((raw, i) => {
+            const s = sourceLink(raw);
+            return s.url ? (
+              <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-50 border border-edge font-num text-[11px] text-primary hover:bg-blue-50 hover:border-accent transition">{s.label}<Icon name="external" className="w-3 h-3" /></a>
+            ) : (
+              <span key={i} className="px-2 py-1 rounded-md bg-slate-50 border border-edge font-num text-[11px] text-sub">{s.label}</span>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function Sub({ title, body }) {
+      return (
+        <div>
+          <h4 className="text-sm font-semibold text-ink mb-1">{title}</h4>
+          <p className="text-sm text-sub leading-relaxed">{body || NO_DETAIL}</p>
+        </div>
+      );
+    }
+
+    function PlainTechToggle({ title, plain, technical }) {
+      const [tech, setTech] = useState(false);
+      return (
+        <div>
+          <div className="flex items-center justify-between mb-2 gap-3 flex-wrap">
+            <h4 className="text-sm font-semibold text-ink">{title}</h4>
+            <div className="inline-flex rounded-lg border border-edge overflow-hidden text-xs">
+              <button onClick={() => setTech(false)} className={`px-2.5 py-1 font-medium ${!tech ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Plain</button>
+              <button onClick={() => setTech(true)} className={`px-2.5 py-1 font-medium ${tech ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Technical</button>
+            </div>
+          </div>
+          <p className="text-sm text-sub leading-relaxed">{(tech ? technical : plain) || NO_DETAIL}</p>
+        </div>
+      );
+    }
+
+    function OverviewCard({ name, kind, overview }) {
+      const [open, setOpen] = useState(false);
+      if (!overview) return null;
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-6 fade-up">
+          <div className="flex items-center gap-2.5 mb-3">
+            <span className="w-9 h-9 rounded-lg bg-blue-50 text-primary flex items-center justify-center"><Icon name={kind === 'disease' ? 'dna' : 'pill'} className="w-5 h-5" /></span>
+            <h2 className="font-display text-2xl text-ink capitalize">About {name}</h2>
+          </div>
+          <p className="text-base text-ink leading-relaxed">{overview.plainSummary || NO_DETAIL}</p>
+          <button onClick={() => setOpen(!open)} className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-accent hover:underline">
+            {open ? 'Hide scientific breakdown' : 'Full scientific breakdown'}<Icon name="chevron" className={`w-4 h-4 transition-transform ${open ? 'rotate-180' : ''}`} />
+          </button>
+          {open && (
+            <div className="mt-5 space-y-5 border-t border-edge pt-5">
+              {kind === 'disease' ? (
+                <>
+                  <PlainTechToggle title="How it works in the body" plain={overview.whatGoesWrong} technical={overview.mechanismDeep} />
+                  <Sub title="Who gets it" body={overview.whoGetsIt} />
+                  <Sub title="How it's diagnosed" body={overview.howDiagnosed} />
+                  <Sub title="Current scientific understanding" body={overview.currentUnderstanding} />
+                </>
+              ) : (
+                <>
+                  <PlainTechToggle title="How it works" plain={overview.mechanismOfAction} technical={overview.mechanismDeep} />
+                  <Sub title="How it moves through the body" body={overview.pharmacokinetics} />
+                  <Sub title="Development &amp; history" body={overview.developmentContext} />
+                  <Sub title="Current scientific understanding" body={overview.currentUnderstanding} />
+                </>
+              )}
+              <SourceChips ids={overview.sourceIds} />
+            </div>
+          )}
+          <p className="text-xs text-slate-400 mt-4">Overview reflects the most current understanding found in retrieved literature. This is scientific background, not medical advice.</p>
+        </div>
+      );
+    }
+
+    function TreatmentCard({ t }) {
+      return (
+        <div className="rounded-xl border border-edge bg-white p-4">
+          <div className="font-semibold text-ink">{t.name}</div>
+          {t.mechanismBrief && <div className="text-sm italic text-sub mt-0.5">{t.mechanismBrief}</div>}
+          {t.evidenceBasis && <div className="text-sm text-ink mt-2"><span className="font-medium">Evidence: </span>{t.evidenceBasis}</div>}
+          {t.typicalUse && <div className="text-sm text-sub mt-1"><span className="font-medium text-ink">Typical use: </span>{t.typicalUse}</div>}
+          {t.caveat && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
+              <span className="text-warning mt-0.5"><Icon name="alert" className="w-4 h-4" /></span>
+              <p className="text-xs text-amber-800 leading-relaxed">{t.caveat}</p>
+            </div>
+          )}
+          <SourceChips ids={t.sourceIds} />
+        </div>
+      );
+    }
+
+    function Tier({ tier, defaultOpen }) {
+      const [open, setOpen] = useState(!!defaultOpen);
+      const list = (tier && tier.treatments) || [];
+      const enough = list.length >= 2;
+      return (
+        <div className="rounded-xl border border-edge bg-white overflow-hidden">
+          <button onClick={() => setOpen(!open)} className="w-full flex items-center justify-between px-5 py-3.5 text-left">
+            <span className="font-semibold text-ink">{tier.label} <span className="font-num text-sm text-sub">({enough ? list.length : 0})</span></span>
+            <Icon name="chevron" className={`w-5 h-5 text-sub transition-transform ${open ? 'rotate-180' : ''}`} />
+          </button>
+          {open && (
+            <div className="px-5 pb-5 border-t border-edge pt-4 space-y-3">
+              {tier.description && <p className="text-sm text-sub">{tier.description}</p>}
+              {enough ? list.map((t, i) => <TreatmentCard key={i} t={t} />) : <p className="text-sm text-sub italic">Insufficient data retrieved for this tier.</p>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function TreatmentTiers({ tiers }) {
+      if (!tiers) return null;
+      const t1 = tiers.tierOne || { label: 'Most established in the evidence', treatments: [] };
+      const t2 = tiers.tierTwo || { label: 'Used in specific circumstances or second-line', treatments: [] };
+      const t3 = tiers.tierThree || { label: 'Emerging, experimental, or less commonly used', treatments: [] };
+      return (
+        <Section title="Treatments &amp; interventions" subtitle="Organized by how commonly and consistently they appear across the retrieved evidence." icon="flask">
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-4 text-sm text-amber-800 leading-relaxed">
+            This ranking reflects how frequently and consistently treatments appear across the retrieved published evidence — <span className="font-semibold">not</span> a recommendation of what any individual patient should use. Treatment decisions depend on individual factors only a clinician can evaluate.
+          </div>
+          <div className="space-y-3">
+            <Tier tier={t1} defaultOpen />
+            <Tier tier={t2} />
+            <Tier tier={t3} />
+          </div>
+          {tiers.tierRationale && <p className="text-xs text-slate-400 mt-3">{tiers.tierRationale}</p>}
+        </Section>
+      );
+    }
+
+    function UseRow({ indication, context, ids, badge }) {
+      const C = { strong: '#059669', moderate: '#CA8A04', limited: '#D97706', anecdotal: '#94A3B8' };
+      return (
+        <div className="rounded-lg border border-edge bg-slate-50 px-4 py-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-ink">{indication}</span>
+            {badge && <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-white" style={{ color: C[badge] || '#475569' }}>{badge} evidence</span>}
+          </div>
+          {context && <p className="text-sm text-sub mt-1 leading-relaxed">{context}</p>}
+          <SourceChips ids={ids} />
+        </div>
+      );
+    }
+
+    function DrugUses({ uses }) {
+      const [tab, setTab] = useState('fda');
+      if (!uses) return null;
+      const fda = uses.fdaApproved || [], off = uses.commonOffLabel || [], inv = uses.underInvestigation || [];
+      const tabs = [['fda', `FDA Approved (${fda.length})`], ['off', `Off-Label (${off.length})`], ['inv', `Under Investigation (${inv.length})`]];
+      return (
+        <Section title="What this drug is used for" icon="pill">
+          <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+            <div className="flex flex-wrap gap-2 mb-4">
+              {tabs.map(([k, l]) => (
+                <button key={k} onClick={() => setTab(k)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${tab === k ? 'bg-primary text-white' : 'bg-slate-50 text-sub border border-edge hover:text-primary'}`}>{l}</button>
+              ))}
+            </div>
+            {tab === 'fda' && (fda.length
+              ? <div className="space-y-3">{fda.map((u, i) => <UseRow key={i} indication={u.indication} context={u.approvalContext} ids={u.sourceIds} />)}</div>
+              : <p className="text-sm text-sub">FDA approval status could not be confirmed from the retrieved literature. <a href="https://www.accessdata.fda.gov/scripts/cder/daf/" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">Verify at fda.gov →</a></p>)}
+            {tab === 'off' && (off.length
+              ? <div className="space-y-3">{off.map((u, i) => <UseRow key={i} indication={u.indication} context={u.useContext} ids={u.sourceIds} badge={u.evidenceLevel} />)}</div>
+              : <p className="text-sm text-sub italic">No off-label uses surfaced in the retrieved literature.</p>)}
+            {tab === 'inv' && (inv.length
+              ? <div className="space-y-3">{inv.map((u, i) => <UseRow key={i} indication={u.indication} context={u.trialContext} ids={u.sourceIds} />)}</div>
+              : <p className="text-sm text-sub italic">No active investigational uses surfaced in the retrieved trials.</p>)}
+            <p className="text-xs text-slate-400 mt-4">{uses.usesDisclaimer || 'This list reflects uses documented in retrieved published literature and may not be complete. FDA approval status should be verified at fda.gov.'}</p>
+          </div>
+        </Section>
+      );
+    }
+
+    function SearchTypeToggle({ value, onChange, rationale }) {
+      return (
+        <div className="rounded-xl border border-edge bg-white shadow-card p-4 flex items-center gap-3 flex-wrap">
+          <span className="text-sm text-sub">{rationale || 'This term could be a disease or a drug.'} Show it as:</span>
+          <div className="inline-flex rounded-lg border border-edge overflow-hidden">
+            <button onClick={() => onChange('disease')} className={`px-3 py-1.5 text-sm font-medium ${value === 'disease' ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Disease</button>
+            <button onClick={() => onChange('drug')} className={`px-3 py-1.5 text-sm font-medium ${value === 'drug' ? 'bg-primary text-white' : 'bg-white text-sub hover:text-primary'}`}>Drug</button>
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
        SINGLE-TOPIC DASHBOARD
     ============================================================ */
-    function Dashboard({ query, synthesis, raw, sortMode, onSort, onBroaden }) {
+    function Dashboard({ query, synthesis, raw, profile, searchType, sortMode, onSort, onBroaden }) {
+      const [viewType, setViewType] = useState(searchType === 'ambiguous' ? 'disease' : (searchType || 'disease'));
+      const effectiveType = searchType === 'ambiguous' ? viewType : (searchType || 'disease');
+      const diseaseName = raw.parsed.condition;
+      const drugName = raw.parsed.drug || raw.parsed.condition;
       const timeline = (synthesis.timelineData && synthesis.timelineData.length >= 2) ? synthesis.timelineData : raw.computedTimeline;
       const allOneYear = raw.pubmed.papers.length > 0 && uniq(raw.pubmed.papers.map((p) => p.year).filter(Boolean)).length <= 1;
       const stats = synthesis.keyStatistics || [];
@@ -1199,7 +1451,14 @@ Return ONLY a JSON object with this exact structure:
             </div>
           </section>
 
-          {/* What we still don't know — promoted to the top */}
+          {/* Scientific profile — disease / drug / combination layouts (drug first for combinations) */}
+          {profile && searchType === 'ambiguous' && <SearchTypeToggle value={viewType} onChange={setViewType} rationale={raw.parsed.searchTypeRationale} />}
+          {profile && (effectiveType === 'combination' || effectiveType === 'drug') && <OverviewCard name={drugName} kind="drug" overview={profile.drugOverview} />}
+          {profile && (effectiveType === 'combination' || effectiveType === 'drug') && <DrugUses uses={profile.drugUses} />}
+          {profile && (effectiveType === 'combination' || effectiveType === 'disease') && <OverviewCard name={diseaseName} kind="disease" overview={profile.diseaseOverview} />}
+          {profile && (effectiveType === 'combination' || effectiveType === 'disease') && <TreatmentTiers tiers={profile.treatmentTiers} />}
+
+          {/* What we still don't know — kept elevated, just below the new context sections */}
           <KnowledgeGaps gaps={synthesis.knowledgeGaps} highlight />
 
           {/* Key statistics */}
@@ -1319,6 +1578,7 @@ Return ONLY a JSON object with this exact structure:
       { label: 'Parsing your query with AI', status: 'pending', detail: '' },
       { label: 'Searching PubMed (ranking by study quality)', status: 'pending', detail: '' },
       { label: 'Searching ClinicalTrials.gov & OpenFDA', status: 'pending', detail: '' },
+      { label: 'Building scientific overview', status: 'pending', detail: '' },
       { label: 'Running statistical synthesis', status: 'pending', detail: '' },
     ];
 
@@ -1373,7 +1633,9 @@ Return ONLY a JSON object with this exact structure:
             setError({ title: 'Could not understand that query', message: 'Try naming a specific condition, drug, or treatment — for example a disease name or a medication.' });
             return;
           }
-          updateStep(0, 'done', parsed.condition + (parsed.drug ? ` · ${parsed.drug}` : ''));
+          const searchType = parsed.searchType || 'disease';
+          const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+          updateStep(0, 'done', `${cap(searchType)} · ${parsed.condition}${parsed.drug ? ` · ${parsed.drug}` : ''}`);
 
           updateStep(1, 'active'); updateStep(2, 'active');
           const pubmedP = fetchPubMed(parsed, sort)
@@ -1388,12 +1650,14 @@ Return ONLY a JSON object with this exact structure:
           if (pm.count === 0 && ct.studies.length === 0) { setPhase('nodata'); return; }
 
           const computedTimeline = computeTimeline(pm.papers);
-          updateStep(3, 'active');
-          const synthesis = await synthesizeData(parsed, pm, ct, fda, computedTimeline);
-          updateStep(3, 'done');
+          updateStep(3, 'active'); updateStep(4, 'active');
+          const [profile, synthesis] = await Promise.all([
+            buildProfile(parsed, searchType, pm, ct, fda).then((p) => { updateStep(3, 'done'); return p; }).catch(() => { updateStep(3, 'error'); return null; }),
+            synthesizeData(parsed, pm, ct, fda, computedTimeline).then((s) => { updateStep(4, 'done'); return s; }),
+          ]);
 
           const fetchedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-          setResult({ synthesis, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fetchedAt } });
+          setResult({ synthesis, profile, searchType, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fetchedAt } });
           setPhase('done');
         } catch (e) {
           console.error(e);
@@ -1440,7 +1704,7 @@ Return ONLY a JSON object with this exact structure:
                 message="We found little or no indexed evidence for that query. This may mean it is very rare, newly emerging, or primarily researched in non-English literature. Try a broader term or one of these:"
                 suggestions={EXAMPLE_CHIPS} onPick={runSearch} />
             )}
-            {phase === 'done' && result && <Dashboard query={query} synthesis={result.synthesis} raw={result.raw} sortMode={sortMode} onSort={onSort} onBroaden={() => onSort('date')} />}
+            {phase === 'done' && result && <Dashboard query={query} synthesis={result.synthesis} raw={result.raw} profile={result.profile} searchType={result.searchType} sortMode={sortMode} onSort={onSort} onBroaden={() => onSort('date')} />}
             {phase === 'compare' && result && <ComparisonDashboard query={result.query} arms={result.arms} />}
             {phase === 'idle' && <div className="max-w-3xl mx-auto mt-16"><About /></div>}
           </main>

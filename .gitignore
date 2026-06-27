@@ -1,0 +1,17 @@
+# secrets
+.env
+.env.local
+.env.*.local
+
+# dependencies / build
+node_modules/
+.vercel/
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.claude/
+
+# logs
+*.log
+npm-debug.log*

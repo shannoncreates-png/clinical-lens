@@ -1,0 +1,14 @@
+{
+  "name": "clinicallens",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-powered clinical evidence synthesis — live data from PubMed, ClinicalTrials.gov, and OpenFDA, synthesized by Claude.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  }
+}

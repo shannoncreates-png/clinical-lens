@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClinicalLens — AI-Powered Clinical Evidence Synthesis</title>
+
+  <!-- Tailwind (Play CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            canvas:  '#F8FAFC',
+            primary: '#1E40AF',
+            accent:  '#0EA5E9',
+            strong:  '#059669',
+            moderate:'#CA8A04',
+            warning: '#D97706',
+            danger:  '#DC2626',
+            ink:     '#0F172A',
+            sub:     '#475569',
+            edge:    '#E2E8F0',
+          },
+          fontFamily: {
+            serif: ['Georgia', "'Times New Roman'", 'serif'],
+            sans:  ['Inter', 'system-ui', 'sans-serif'],
+            mono:  ["'JetBrains Mono'", "'Courier New'", 'monospace'],
+          },
+          boxShadow: {
+            card: '0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)',
+            lift: '0 10px 30px rgba(15,23,42,0.10)',
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <!-- React (UMD) + Babel. No chart library — the timeline is hand-drawn SVG so nothing external can fail. -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    // Force the CLASSIC JSX runtime (React.createElement). The default automatic
+    // runtime emits an ESM `import` that cannot run inside a classic <script>,
+    // which would silently abort the whole app.
+    Babel.registerPreset('react-classic', { presets: [[Babel.availablePresets.react, { runtime: 'classic' }]] });
+  </script>
+
+  <style>
+    html, body { background: #F8FAFC; }
+    body { font-family: 'Inter', system-ui, sans-serif; color: #0F172A; -webkit-font-smoothing: antialiased; }
+    .font-display { font-family: Georgia, 'Times New Roman', serif; }
+    .font-num { font-family: 'JetBrains Mono', 'Courier New', monospace; font-variant-numeric: tabular-nums; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    @keyframes fadeUp { from { opacity:0; transform: translateY(8px);} to {opacity:1; transform:none;} }
+    .fade-up { animation: fadeUp .45s ease both; }
+    @keyframes spin360 { to { transform: rotate(360deg);} }
+    .spin { animation: spin360 .9s linear infinite; }
+    @keyframes pulseDot { 0%,100%{opacity:.35;} 50%{opacity:1;} }
+    .pulse-dot { animation: pulseDot 1.2s ease-in-out infinite; }
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+    .ring-focus:focus { outline: none; box-shadow: 0 0 0 3px rgba(14,165,233,.35); }
+    .tl-dot { transition: r .12s ease; }
+    .tl-dot:hover { r: 5; }
+    .line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <!-- Fallback shown only if the script never mounts -->
+    <noscript style="display:block;padding:2rem;font-family:sans-serif">ClinicalLens requires JavaScript.</noscript>
+  </div>
+
+  <script type="text/babel" data-presets="react-classic">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* ============================================================
+       CONSTANTS
+    ============================================================ */
+    const CLAUDE_PROXY = '/api/claude';      // serverless backend (key lives on the server)
+
+    const EUTILS = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+    const CT_API = 'https://clinicaltrials.gov/api/v2/studies';
+    const FDA_API = 'https://api.fda.gov/drug/event.json';
+
+    const EXAMPLE_CHIPS = [
+      'Duchenne Muscular Dystrophy',
+      'Voclosporin',
+      'Childhood ALL',
+      'Ozempic long-term outcomes',
+    ];
+
+    const EVIDENCE = {
+      strong:       { label: 'Strong evidence',       color: '#059669', bg: '#ECFDF5', ring: '#A7F3D0' },
+      moderate:     { label: 'Moderate evidence',     color: '#CA8A04', bg: '#FEFCE8', ring: '#FDE68A' },
+      limited:      { label: 'Limited evidence',      color: '#D97706', bg: '#FFF7ED', ring: '#FED7AA' },
+      insufficient: { label: 'Insufficient evidence', color: '#DC2626', bg: '#FEF2F2', ring: '#FECACA' },
+    };
+
+    const QUALITY = {
+      high:     { label: 'High quality',     color: '#059669', bg: '#ECFDF5' },
+      moderate: { label: 'Moderate quality', color: '#CA8A04', bg: '#FEFCE8' },
+      low:      { label: 'Low quality',      color: '#D97706', bg: '#FFF7ED' },
+      very_low: { label: 'Very low quality', color: '#DC2626', bg: '#FEF2F2' },
+    };
+
+    const SOURCE_TYPE_LABEL = {
+      clinical_trial:     'Clinical Trial',
+      observational_study:'Observational Study',
+      meta_analysis:      'Meta-analysis',
+      case_series:        'Case Series',
+    };
+
+    /* ============================================================
+       SMALL UTILITIES
+    ============================================================ */
+    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+    const enc = encodeURIComponent;
+    const fmtInt = (n) => (n == null || isNaN(n) ? '—' : Number(n).toLocaleString());
+
+    function extractJSON(text) {
+      if (!text) throw new Error('Empty AI response.');
+      const tryParse = (s) => { try { return JSON.parse(s); } catch (e) { return undefined; } };
+      let v = tryParse(text);
+      if (v !== undefined) return v;
+      let t = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      v = tryParse(t);
+      if (v !== undefined) return v;
+      const first = t.indexOf('{');
+      const last = t.lastIndexOf('}');
+      if (first !== -1 && last !== -1 && last > first) {
+        v = tryParse(t.slice(first, last + 1));
+        if (v !== undefined) return v;
+      }
+      throw new Error('Could not parse JSON from the AI response.');
+    }
+
+    function sourceLink(rawId) {
+      const id = String(rawId || '').trim();
+      if (/^PMID[:\s]/i.test(id)) {
+        const n = id.replace(/^PMID[:\s]*/i, '').trim();
+        return { label: 'PMID ' + n, url: `https://pubmed.ncbi.nlm.nih.gov/${n}/` };
+      }
+      if (/^NCT[:\s]/i.test(id)) {
+        const n = id.replace(/^NCT[:\s]*/i, '').trim();
+        const nct = /^NCT/i.test(n) ? n : 'NCT' + n;
+        return { label: nct, url: `https://clinicaltrials.gov/study/${nct}` };
+      }
+      if (/^NCT\d+$/i.test(id)) return { label: id, url: `https://clinicaltrials.gov/study/${id}` };
+      if (/^\d{5,9}$/.test(id)) return { label: 'PMID ' + id, url: `https://pubmed.ncbi.nlm.nih.gov/${id}/` };
+      return { label: id, url: null };
+    }
+
+    /* ============================================================
+       ANTHROPIC CALL (via serverless proxy — no key in the browser)
+    ============================================================ */
+    async function callClaude(system, userContent, { maxTokens = 4096, prefill = '{' } = {}) {
+      const messages = [{ role: 'user', content: userContent }];
+      if (prefill) messages.push({ role: 'assistant', content: prefill });
+
+      let res;
+      try {
+        res = await fetch(CLAUDE_PROXY, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ system, messages, max_tokens: maxTokens }),
+        });
+      } catch (e) {
+        throw new Error('Could not reach the synthesis backend. If running locally, start it with "node server.js" (or deploy to Vercel).');
+      }
+
+      if (!res.ok) {
+        let detail = '';
+        try { const j = await res.json(); detail = (j.error && (j.error.message || j.error)) || j.message || ''; } catch (e) {}
+        if (res.status === 404) throw new Error('The /api/claude backend was not found. Deploy to Vercel, or run "node server.js" locally.');
+        if (res.status === 500 && /ANTHROPIC_API_KEY/i.test(detail)) throw new Error('The server has no API key configured. Add the ANTHROPIC_API_KEY environment variable in your Vercel project settings.');
+        if (res.status === 401) throw new Error('The server\'s Anthropic API key was rejected (401). Check ANTHROPIC_API_KEY.');
+        if (res.status === 429) throw new Error('Anthropic rate limit reached. Wait a moment and try again.');
+        throw new Error(`Synthesis backend error (${res.status}). ${detail}`);
+      }
+
+      const data = await res.json();
+      if (data && data.error) throw new Error(data.error.message || String(data.error));
+      const text = (data.content || []).map((c) => c.text || '').join('');
+      return extractJSON((prefill || '') + text);
+    }
+
+    /* ============================================================
+       STEP 1 — QUERY PARSING
+    ============================================================ */
+    const PARSE_SYSTEM = `You are a medical search query parser. Extract structured search terms from the user's query.
+The query may be ANY drug, disease, condition, treatment, biomarker, or combination — be fully general.
+Return ONLY a JSON object with these fields:
+{
+  "condition": "primary medical condition name",
+  "meshTerm": "MeSH term if known, else null",
+  "drug": "drug name if mentioned, else null",
+  "outcomeType": "one of: treatment_outcomes, drug_efficacy, survival, remission, safety, general",
+  "pubmedQuery": "optimized PubMed search string using boolean operators",
+  "plainLanguageTopic": "what the user is asking about in plain English"
+}`;
+
+    async function parseQuery(raw) {
+      return callClaude(PARSE_SYSTEM, `User query: "${raw}"`, { maxTokens: 600 });
+    }
+
+    /* ============================================================
+       STEP 2 — DATA FETCHERS (public APIs, run client-side)
+    ============================================================ */
+    async function pubmedSearch(term) {
+      const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=50&retmode=json`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('PubMed search failed');
+      const json = await res.json();
+      const ids = (json.esearchresult && json.esearchresult.idlist) || [];
+      const total = parseInt((json.esearchresult && json.esearchresult.count) || ids.length, 10) || ids.length;
+      return { ids, total };
+    }
+
+    async function fetchPubMed(parsed) {
+      // Try the optimized boolean query first; fall back to the bare condition so ANY topic resolves.
+      let { ids, total } = await pubmedSearch(parsed.pubmedQuery || parsed.condition || '');
+      if (ids.length === 0 && parsed.condition && parsed.condition !== parsed.pubmedQuery) {
+        await delay(300);
+        ({ ids, total } = await pubmedSearch(parsed.condition));
+      }
+      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '' };
+
+      await delay(300);
+      const sumRes = await fetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
+      const sumJson = await sumRes.json();
+      const result = (sumJson && sumJson.result) || {};
+
+      const papers = ids.map((id) => {
+        const d = result[id];
+        if (!d) return null;
+        const yraw = d.pubdate ? String(d.pubdate).split(' ')[0].replace(/[^0-9]/g, '') : '';
+        return {
+          pmid: id,
+          title: d.title || '(no title)',
+          authors: (d.authors || []).map((a) => a.name).slice(0, 6).join(', '),
+          journal: d.fulljournalname || d.source || '',
+          year: yraw.length === 4 ? parseInt(yraw, 10) : null,
+          pubtype: (d.pubtype || []).join(', '),
+        };
+      }).filter(Boolean);
+
+      let abstracts = '';
+      try {
+        await delay(300);
+        const topIds = ids.slice(0, 10);
+        const absRes = await fetch(`${EUTILS}/efetch.fcgi?db=pubmed&id=${topIds.join(',')}&rettype=abstract&retmode=text`);
+        if (absRes.ok) abstracts = await absRes.text();
+      } catch (e) { /* abstracts are best-effort */ }
+
+      return { ids, papers, count: papers.length, totalAvailable: total, abstracts };
+    }
+
+    function bucketPhase(phase) {
+      const p = String(phase || '').toUpperCase();
+      if (p.includes('PHASE4')) return 'approved';
+      if (p.includes('PHASE3')) return 'phase3';
+      if (p.includes('PHASE2') || p.includes('PHASE1') || p.includes('EARLY')) return 'phase1_2';
+      return 'other';
+    }
+
+    async function fetchTrials(parsed) {
+      const params = new URLSearchParams();
+      if (parsed.condition) params.append('query.cond', parsed.condition);
+      if (parsed.drug) params.append('query.intr', parsed.drug);
+      params.append('pageSize', '20');
+      params.append('countTotal', 'true');
+      const res = await fetch(`${CT_API}?${params.toString()}`);
+      if (!res.ok) throw new Error('ClinicalTrials.gov request failed');
+      const json = await res.json();
+      const studies = (json.studies || []).map((s) => {
+        const p = s.protocolSection || {};
+        const idm = p.identificationModule || {};
+        const stm = p.statusModule || {};
+        const dsm = p.designModule || {};
+        const oem = p.outcomesModule || {};
+        const phases = dsm.phases || [];
+        return {
+          nctId: idm.nctId,
+          title: idm.briefTitle || '(untitled study)',
+          status: stm.overallStatus || 'UNKNOWN',
+          phase: phases.length ? phases.map((x) => x.replace('PHASE', 'Phase ').replace('EARLY_Phase 1', 'Early Phase 1')).join('/') : 'N/A',
+          bucket: bucketPhase(phases.join('/')),
+          enrollment: (dsm.enrollmentInfo && dsm.enrollmentInfo.count) || null,
+          primaryOutcome: (oem.primaryOutcomes || []).map((o) => o.measure).slice(0, 3).join('; '),
+          startDate: (stm.startDateStruct && stm.startDateStruct.date) || '',
+          completionDate: (stm.completionDateStruct && stm.completionDateStruct.date) || '',
+          hasResults: !!s.hasResults,
+        };
+      }).filter((s) => s.nctId);
+      return { studies, count: json.totalCount != null ? json.totalCount : studies.length };
+    }
+
+    async function fetchFDA(parsed) {
+      if (!parsed.drug) return null;
+      const drug = enc(`"${parsed.drug}"`);
+      try {
+        const cRes = await fetch(`${FDA_API}?search=patient.drug.medicinalproduct:${drug}&count=patient.reaction.reactionmeddrapt.exact`);
+        if (!cRes.ok) return null; // openFDA returns 404 when zero matches
+        const cJson = await cRes.json();
+        const total = (cJson.meta && cJson.meta.results && cJson.meta.results.total) || 0;
+        const topReactions = (cJson.results || []).slice(0, 15).map((r) => ({ term: r.term, count: r.count }));
+        let seriousCount = null;
+        try {
+          const sRes = await fetch(`${FDA_API}?search=patient.drug.medicinalproduct:${drug}+AND+serious:1&limit=1`);
+          if (sRes.ok) { const sJson = await sRes.json(); seriousCount = (sJson.meta && sJson.meta.results && sJson.meta.results.total) || 0; }
+        } catch (e) {}
+        if (!total && topReactions.length === 0) return null;
+        return { drug: parsed.drug, totalReports: total, topReactions, seriousCount };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function computeTimeline(papers) {
+      const counts = {};
+      const nowY = new Date().getFullYear();
+      papers.forEach((p) => { if (p.year && p.year > 1950 && p.year <= nowY + 1) counts[p.year] = (counts[p.year] || 0) + 1; });
+      const years = Object.keys(counts).map(Number).sort((a, b) => a - b);
+      if (years.length === 0) return [];
+      const out = [];
+      for (let y = years[0]; y <= years[years.length - 1]; y++) out.push({ year: y, studyCount: counts[y] || 0 });
+      return out;
+    }
+
+    /* ============================================================
+       STEP 3 — STATISTICAL SYNTHESIS
+    ============================================================ */
+    const SYNTH_SYSTEM = `You are a clinical biostatistician and medical evidence synthesizer. You have been given raw data
+from PubMed, ClinicalTrials.gov, and OpenFDA about a medical topic.
+
+Your job is to produce a rigorous, sourced statistical synthesis. You must:
+1. NEVER invent statistics — only report what is directly supported by the source data provided
+2. Always cite the specific PMID or NCT number for every statistic you mention
+3. Flag when data is limited, conflicting, or from low-quality studies
+4. Use established meta-analysis conventions: report ranges, medians, and note heterogeneity
+5. Clearly distinguish between: Phase 1/2 trials (early signal), Phase 3 (stronger evidence),
+   real-world data, and systematic reviews
+6. Note sample sizes — small studies (n<50) must be flagged as preliminary
+7. Communicate uncertainty honestly using plain language
+
+Return ONLY a JSON object with this exact structure:
+{
+  "toplineSummary": "2-3 sentence plain English summary of what the evidence shows",
+  "evidenceStrength": "strong|moderate|limited|insufficient",
+  "evidenceRationale": "one sentence explaining why",
+  "totalStudiesFound": number,
+  "totalTrialsFound": number,
+  "totalPatientsAcrossStudies": number or null if unknown,
+  "keyStatistics": [
+    {
+      "label": "statistic name e.g. Complete Remission Rate",
+      "value": "e.g. 23-41%",
+      "context": "plain English explanation of what this means",
+      "sourceType": "one of: clinical_trial|observational_study|meta_analysis|case_series",
+      "sourceIds": ["PMID:12345678", "NCT:12345678"],
+      "sampleSize": number or null,
+      "studyQuality": "high|moderate|low|very_low",
+      "caveat": "any important limitation or caveat, or null"
+    }
+  ],
+  "outcomesByPhase": {
+    "phase1_2": { "trialCount": number, "summary": "string" },
+    "phase3": { "trialCount": number, "summary": "string" },
+    "approved": { "count": number, "summary": "string" }
+  },
+  "timelineData": [
+    { "year": number, "studyCount": number, "label": "optional context" }
+  ],
+  "activeTrials": [
+    {
+      "nctId": "string",
+      "title": "string",
+      "phase": "string",
+      "enrollment": number,
+      "status": "string",
+      "url": "https://clinicaltrials.gov/study/{nctId}"
+    }
+  ],
+  "knowledgeGaps": ["list of areas where evidence is thin or missing"],
+  "patientConsiderations": ["list of plain-language points specifically relevant to patients and families"],
+  "researcherNotes": ["list of methodological notes relevant to clinicians or researchers"],
+  "dataLimitations": "paragraph describing overall limitations of the available evidence",
+  "disclaimer": "This synthesis is for informational purposes only and does not constitute medical advice. Consult a qualified healthcare provider for any medical decisions."
+}`;
+
+    async function synthesizeData(parsed, pm, ct, fda, timeline) {
+      const payload = {
+        topic: parsed.plainLanguageTopic,
+        condition: parsed.condition,
+        drug: parsed.drug,
+        outcomeType: parsed.outcomeType,
+        pubmed: {
+          totalAvailableInPubMed: pm ? pm.totalAvailable : 0,
+          returnedForAnalysis: pm ? pm.count : 0,
+          papers: pm ? pm.papers.map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, type: p.pubtype })) : [],
+          abstractsTop10: pm ? (pm.abstracts || '').slice(0, 7000) : '',
+        },
+        clinicalTrials: {
+          totalMatching: ct ? ct.count : 0,
+          studies: ct ? ct.studies.map((s) => ({
+            nctId: s.nctId, title: s.title, phase: s.phase, status: s.status,
+            enrollment: s.enrollment, primaryOutcome: s.primaryOutcome,
+            startDate: s.startDate, completionDate: s.completionDate, hasResults: s.hasResults,
+          })) : [],
+        },
+        openFDA: fda,
+        precomputedPublicationTimeline: timeline,
+      };
+
+      const user = `Here is the raw data retrieved live from the source APIs. Produce the synthesis JSON. ` +
+        `Cite only PMIDs and NCT numbers that appear in this data. Use the precomputedPublicationTimeline ` +
+        `values for timelineData (counted directly from the returned PubMed records).\n\n` +
+        '<raw_data>\n' + JSON.stringify(payload) + '\n</raw_data>';
+
+      return callClaude(SYNTH_SYSTEM, user, { maxTokens: 6000 });
+    }
+
+    /* ============================================================
+       ICONS
+    ============================================================ */
+    function Icon({ name, className = 'w-5 h-5' }) {
+      const paths = {
+        search: <><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></>,
+        check: <path d="M20 6 9 17l-5-5" />,
+        external: <><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></>,
+        alert: <><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>,
+        flask: <><path d="M9 3h6" /><path d="M10 3v6l-5.5 9.5A2 2 0 0 0 6.2 21h11.6a2 2 0 0 0 1.7-2.5L14 9V3" /><path d="M7 14h10" /></>,
+        book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>,
+        chevron: <path d="m6 9 6 6 6-6" />,
+        info: <><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></>,
+        users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></>,
+        microscope: <><path d="M6 18h8" /><path d="M3 22h18" /><path d="M14 22a7 7 0 1 0 0-14h-1" /><path d="M9 14h2" /><path d="M9 12a2 2 0 0 1-2-2V6h6v4a2 2 0 0 1-2 2Z" /><path d="M12 6V3a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1v3" /></>,
+        clock: <><circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" /></>,
+      };
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+          {paths[name]}
+        </svg>
+      );
+    }
+
+    /* ============================================================
+       SEARCH BAR
+    ============================================================ */
+    function SearchBar({ onSearch, busy }) {
+      const [value, setValue] = useState('');
+      const submit = (e) => { e.preventDefault(); if (value.trim() && !busy) onSearch(value.trim()); };
+      return (
+        <div className="w-full">
+          <form onSubmit={submit} className="relative">
+            <div className="absolute left-5 top-1/2 -translate-y-1/2 text-sub"><Icon name="search" className="w-5 h-5" /></div>
+            <input
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder="Search any condition, drug, or treatment..."
+              disabled={busy}
+              className="ring-focus w-full h-14 pl-14 pr-32 rounded-xl border border-edge bg-white text-base text-ink placeholder:text-slate-400 shadow-card focus:border-accent transition disabled:opacity-60"
+            />
+            <button type="submit" disabled={busy || !value.trim()}
+              className="absolute right-2 top-1/2 -translate-y-1/2 h-10 px-5 rounded-lg bg-primary text-white text-sm font-semibold hover:bg-blue-800 transition disabled:opacity-50 disabled:cursor-not-allowed">
+              {busy ? 'Searching…' : 'Analyze'}
+            </button>
+          </form>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-sub mr-1">Try:</span>
+            {EXAMPLE_CHIPS.map((c) => (
+              <button key={c} onClick={() => !busy && onSearch(c)} disabled={busy}
+                className="px-3 py-1.5 rounded-full border border-edge bg-white text-xs font-medium text-sub hover:border-accent hover:text-primary transition disabled:opacity-50">
+                {c}
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       LOADING STATE
+    ============================================================ */
+    function LoadingState({ steps }) {
+      return (
+        <div className="max-w-2xl mx-auto mt-10 bg-white rounded-2xl border border-edge shadow-card p-7 fade-up">
+          <div className="flex items-center gap-2 mb-5">
+            <span className="w-2.5 h-2.5 rounded-full bg-accent pulse-dot"></span>
+            <h3 className="font-display text-lg text-ink">Searching live medical databases…</h3>
+          </div>
+          <ul className="space-y-3">
+            {steps.map((s, i) => (
+              <li key={i} className="flex items-start gap-3">
+                <span className="mt-0.5 flex-shrink-0">
+                  {s.status === 'done' && <span className="w-6 h-6 rounded-full bg-strong/10 text-strong flex items-center justify-center"><Icon name="check" className="w-4 h-4" /></span>}
+                  {s.status === 'active' && <span className="w-6 h-6 rounded-full border-2 border-accent border-t-transparent spin block"></span>}
+                  {s.status === 'pending' && <span className="w-6 h-6 rounded-full border-2 border-edge block"></span>}
+                  {s.status === 'error' && <span className="w-6 h-6 rounded-full bg-danger/10 text-danger flex items-center justify-center"><Icon name="alert" className="w-4 h-4" /></span>}
+                </span>
+                <div className="pt-0.5">
+                  <div className="text-xs font-num text-slate-400">Step {i + 1}/{steps.length}</div>
+                  <div className={`text-sm font-medium ${s.status === 'pending' ? 'text-slate-400' : 'text-ink'}`}>
+                    {s.label}{s.detail ? <span className="text-sub font-normal"> — {s.detail}</span> : ''}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       BADGES & CARDS
+    ============================================================ */
+    function EvidenceBadge({ strength }) {
+      const e = EVIDENCE[strength] || EVIDENCE.insufficient;
+      return (
+        <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-semibold"
+          style={{ color: e.color, background: e.bg, boxShadow: `inset 0 0 0 1px ${e.ring}` }}>
+          <span className="w-2 h-2 rounded-full" style={{ background: e.color }}></span>{e.label}
+        </span>
+      );
+    }
+
+    function StatCard({ label, value, icon }) {
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-5">
+          <div className="flex items-center gap-2 text-sub mb-2">
+            <Icon name={icon} className="w-4 h-4" />
+            <span className="text-xs font-medium uppercase tracking-wide">{label}</span>
+          </div>
+          <div className="font-num text-3xl font-semibold text-ink">{value}</div>
+        </div>
+      );
+    }
+
+    function QualityBadge({ quality }) {
+      const q = QUALITY[quality] || QUALITY.very_low;
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold" style={{ color: q.color, background: q.bg }}>{q.label}</span>
+      );
+    }
+
+    function KeyStatisticCard({ stat }) {
+      const q = QUALITY[stat.studyQuality] || QUALITY.very_low;
+      const ids = stat.sourceIds || [];
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-5 fade-up" style={{ borderLeft: `5px solid ${q.color}` }}>
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="min-w-0">
+              <div className="font-num text-2xl font-bold text-ink leading-tight">{stat.value}</div>
+              <div className="text-sm font-semibold text-primary mt-1">{stat.label}</div>
+            </div>
+            <QualityBadge quality={stat.studyQuality} />
+          </div>
+          {stat.context && <p className="text-sm text-sub mt-3 leading-relaxed">{stat.context}</p>}
+          {stat.caveat && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
+              <span className="text-warning mt-0.5"><Icon name="alert" className="w-4 h-4" /></span>
+              <p className="text-xs text-amber-800 leading-relaxed">{stat.caveat}</p>
+            </div>
+          )}
+          <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+            {stat.sourceType && <span className="text-sub">{SOURCE_TYPE_LABEL[stat.sourceType] || stat.sourceType}</span>}
+            {stat.sampleSize != null && (
+              <span className="font-num text-sub">n&nbsp;=&nbsp;{fmtInt(stat.sampleSize)}{stat.sampleSize < 50 ? ' (preliminary)' : ''}</span>
+            )}
+          </div>
+          {ids.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {ids.map((raw, i) => {
+                const s = sourceLink(raw);
+                return s.url ? (
+                  <a key={i} href={s.url} target="_blank" rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-50 border border-edge font-num text-[11px] text-primary hover:bg-blue-50 hover:border-accent transition">
+                    {s.label}<Icon name="external" className="w-3 h-3" />
+                  </a>
+                ) : (
+                  <span key={i} className="inline-flex items-center px-2 py-1 rounded-md bg-slate-50 border border-edge font-num text-[11px] text-sub">{s.label}</span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       RESEARCH TIMELINE — hand-drawn SVG (no chart library)
+    ============================================================ */
+    function ResearchTimeline({ data }) {
+      if (!data || data.length < 2) {
+        return <div className="text-sm text-sub bg-slate-50 rounded-lg p-4 border border-edge">Not enough dated publications to plot a research trend.</div>;
+      }
+      const W = 760, H = 260, padL = 40, padR = 18, padT = 16, padB = 34;
+      const years = data.map((d) => d.year);
+      const minY = Math.min(...years), maxY = Math.max(...years);
+      const maxC = Math.max(1, ...data.map((d) => d.studyCount));
+      const sx = (yr) => padL + (maxY === minY ? 0 : (yr - minY) / (maxY - minY)) * (W - padL - padR);
+      const sy = (c) => H - padB - (c / maxC) * (H - padT - padB);
+
+      const pts = data.map((d) => [sx(d.year), sy(d.studyCount)]);
+      const linePath = 'M ' + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' L ');
+      const areaPath = `M ${pts[0][0].toFixed(1)},${H - padB} L ` + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' L ') + ` L ${pts[pts.length - 1][0].toFixed(1)},${H - padB} Z`;
+
+      const yTickCount = Math.min(4, maxC);
+      const yTicks = [];
+      for (let i = 0; i <= yTickCount; i++) yTicks.push(Math.round((maxC / yTickCount) * i));
+
+      const span = maxY - minY;
+      const labelStep = Math.max(1, Math.ceil((span + 1) / 8));
+      const xLabels = [];
+      for (let yr = minY; yr <= maxY; yr += labelStep) xLabels.push(yr);
+      if (xLabels[xLabels.length - 1] !== maxY) xLabels.push(maxY);
+
+      return (
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block' }}>
+          <defs>
+            <linearGradient id="tlFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#0EA5E9" stopOpacity="0.30" />
+              <stop offset="100%" stopColor="#0EA5E9" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          {Array.from(new Set(yTicks)).map((t, i) => {
+            const y = sy(t);
+            return (
+              <g key={i}>
+                <line x1={padL} y1={y} x2={W - padR} y2={y} stroke="#E2E8F0" strokeDasharray="3 3" />
+                <text x={padL - 8} y={y + 4} textAnchor="end" fontSize="11" fill="#475569" fontFamily="'JetBrains Mono', monospace">{t}</text>
+              </g>
+            );
+          })}
+          <path d={areaPath} fill="url(#tlFill)" />
+          <path d={linePath} fill="none" stroke="#1E40AF" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+          {pts.map((p, i) => (
+            <circle key={i} className="tl-dot" cx={p[0]} cy={p[1]} r="2.6" fill="#1E40AF">
+              <title>{data[i].year}: {data[i].studyCount} publication{data[i].studyCount === 1 ? '' : 's'}</title>
+            </circle>
+          ))}
+          {xLabels.map((yr, i) => (
+            <text key={i} x={sx(yr)} y={H - padB + 18} textAnchor="middle" fontSize="11" fill="#475569" fontFamily="'JetBrains Mono', monospace">{yr}</text>
+          ))}
+        </svg>
+      );
+    }
+
+    /* ============================================================
+       TRIAL PIPELINE
+    ============================================================ */
+    function PhaseColumn({ title, count, summary, accent }) {
+      return (
+        <div className="rounded-xl border border-edge bg-white p-4 flex-1 min-w-0">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-semibold text-ink">{title}</span>
+            <span className="font-num text-2xl font-bold" style={{ color: accent }}>{count}</span>
+          </div>
+          <div className="mt-2 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full rounded-full" style={{ width: count > 0 ? '100%' : '0%', background: accent, opacity: .85 }}></div>
+          </div>
+          {summary && <p className="text-xs text-sub mt-3 leading-relaxed">{summary}</p>}
+        </div>
+      );
+    }
+
+    function TrialPipeline({ trials, outcomesByPhase }) {
+      const obp = outcomesByPhase || {};
+      const counts = trials.reduce((acc, t) => { acc[t.bucket] = (acc[t.bucket] || 0) + 1; return acc; }, {});
+      const pick = (a, b) => (a != null ? a : (b != null ? b : 0));
+      const p12 = pick(obp.phase1_2 && obp.phase1_2.trialCount, counts.phase1_2);
+      const p3 = pick(obp.phase3 && obp.phase3.trialCount, counts.phase3);
+      const appr = pick(obp.approved && obp.approved.count, counts.approved);
+
+      const statusColor = (s) => {
+        const u = String(s || '').toUpperCase();
+        if (u.includes('RECRUIT')) return 'text-strong bg-emerald-50';
+        if (u.includes('ACTIVE')) return 'text-accent bg-sky-50';
+        if (u.includes('COMPLETED')) return 'text-primary bg-blue-50';
+        if (u.includes('TERMINATED') || u.includes('WITHDRAWN') || u.includes('SUSPENDED')) return 'text-danger bg-red-50';
+        return 'text-sub bg-slate-100';
+      };
+      const pretty = (s) => String(s || '').replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+
+      return (
+        <div>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <PhaseColumn title="Phase 1 / 2" count={p12} summary={obp.phase1_2 && obp.phase1_2.summary} accent="#0EA5E9" />
+            <PhaseColumn title="Phase 3" count={p3} summary={obp.phase3 && obp.phase3.summary} accent="#1E40AF" />
+            <PhaseColumn title="Phase 4 / Approved" count={appr} summary={obp.approved && obp.approved.summary} accent="#059669" />
+          </div>
+          {trials.length > 0 && (
+            <div className="mt-5 overflow-x-auto rounded-xl border border-edge">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-slate-50 text-left text-xs uppercase tracking-wide text-sub">
+                    <th className="px-4 py-3 font-semibold">Trial</th>
+                    <th className="px-4 py-3 font-semibold whitespace-nowrap">Phase</th>
+                    <th className="px-4 py-3 font-semibold whitespace-nowrap">Status</th>
+                    <th className="px-4 py-3 font-semibold whitespace-nowrap text-right">Enrollment</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trials.slice(0, 12).map((t) => (
+                    <tr key={t.nctId} className="border-t border-edge hover:bg-slate-50/60">
+                      <td className="px-4 py-3 max-w-md">
+                        <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                          <span className="line-clamp-2">{t.title}</span>
+                        </a>
+                        <div className="font-num text-[11px] text-slate-400 mt-0.5">{t.nctId}</div>
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap text-sub">{t.phase}</td>
+                      <td className="px-4 py-3 whitespace-nowrap"><span className={`px-2 py-0.5 rounded text-[11px] font-medium ${statusColor(t.status)}`}>{pretty(t.status)}</span></td>
+                      <td className="px-4 py-3 whitespace-nowrap text-right font-num text-sub">{fmtInt(t.enrollment)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       PATIENT / RESEARCHER PANEL
+    ============================================================ */
+    function ListBlock({ items, color }) {
+      if (!items || items.length === 0) return <p className="text-sm text-sub italic">No specific points were generated.</p>;
+      return (
+        <ul className="space-y-2.5">
+          {items.map((t, i) => (
+            <li key={i} className="flex items-start gap-2.5 text-sm text-ink leading-relaxed">
+              <span className="mt-2 w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: color }}></span><span>{t}</span>
+            </li>
+          ))}
+        </ul>
+      );
+    }
+
+    function PatientResearcherPanel({ patient, researcher }) {
+      return (
+        <div className="grid md:grid-cols-2 gap-5">
+          <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <span className="w-9 h-9 rounded-lg bg-sky-50 text-accent flex items-center justify-center"><Icon name="users" className="w-5 h-5" /></span>
+              <h3 className="font-display text-lg text-ink">For Patients &amp; Families</h3>
+            </div>
+            <ListBlock items={patient} color="#0EA5E9" />
+          </div>
+          <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <span className="w-9 h-9 rounded-lg bg-blue-50 text-primary flex items-center justify-center"><Icon name="microscope" className="w-5 h-5" /></span>
+              <h3 className="font-display text-lg text-ink">For Clinicians &amp; Researchers</h3>
+            </div>
+            <ListBlock items={researcher} color="#1E40AF" />
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       KNOWLEDGE GAPS
+    ============================================================ */
+    function KnowledgeGaps({ gaps }) {
+      if (!gaps || gaps.length === 0) return null;
+      return (
+        <div className="bg-white rounded-xl border border-edge shadow-card p-6">
+          <h3 className="font-display text-lg text-ink mb-1">What we still don't know</h3>
+          <p className="text-sm text-sub mb-4">Areas where the published evidence is thin or missing — useful for advocates and researchers.</p>
+          <div className="grid sm:grid-cols-2 gap-3">
+            {gaps.map((g, i) => (
+              <div key={i} className="flex items-start gap-3 rounded-lg bg-slate-50 border border-edge px-4 py-3">
+                <span className="font-num text-xs text-slate-400 mt-0.5">{String(i + 1).padStart(2, '0')}</span>
+                <span className="text-sm text-ink leading-relaxed">{g}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       SOURCES PANEL
+    ============================================================ */
+    function SourcesPanel({ papers, trials, fetchedAt, fda }) {
+      const total = papers.length + trials.length;
+      return (
+        <details className="bg-white rounded-xl border border-edge shadow-card overflow-hidden group">
+          <summary className="flex items-center justify-between px-6 py-4 select-none">
+            <div className="flex items-center gap-2">
+              <Icon name="book" className="w-5 h-5 text-primary" />
+              <span className="font-display text-lg text-ink">View all sources</span>
+              <span className="font-num text-xs text-sub bg-slate-100 px-2 py-0.5 rounded-full">{total}</span>
+            </div>
+            <Icon name="chevron" className="w-5 h-5 text-sub transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="px-6 pb-6 border-t border-edge pt-5">
+            <div className="flex items-center gap-2 text-xs text-sub mb-5">
+              <Icon name="clock" className="w-4 h-4" />
+              <span>Data pulled live from PubMed, ClinicalTrials.gov, and OpenFDA on {fetchedAt}</span>
+            </div>
+            <div className="grid lg:grid-cols-2 gap-6">
+              <div>
+                <h4 className="text-sm font-semibold text-ink mb-3 flex items-center gap-2"><Icon name="book" className="w-4 h-4 text-primary" /> PubMed papers ({papers.length})</h4>
+                <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
+                  {papers.length === 0 && <p className="text-sm text-sub italic">No PubMed records returned.</p>}
+                  {papers.map((p) => (
+                    <div key={p.pmid} className="text-sm border-l-2 border-edge pl-3">
+                      <a href={`https://pubmed.ncbi.nlm.nih.gov/${p.pmid}/`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline font-medium">{p.title}</a>
+                      <div className="text-xs text-sub mt-0.5">{p.authors && <span>{p.authors} · </span>}<span className="italic">{p.journal}</span>{p.year ? ` · ${p.year}` : ''}</div>
+                      <div className="font-num text-[11px] text-slate-400 mt-0.5">PMID {p.pmid}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-ink mb-3 flex items-center gap-2"><Icon name="flask" className="w-4 h-4 text-primary" /> ClinicalTrials.gov studies ({trials.length})</h4>
+                <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
+                  {trials.length === 0 && <p className="text-sm text-sub italic">No registered trials returned.</p>}
+                  {trials.map((t) => (
+                    <div key={t.nctId} className="text-sm border-l-2 border-edge pl-3">
+                      <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline font-medium">{t.title}</a>
+                      <div className="text-xs text-sub mt-0.5">{t.phase} · {String(t.status || '').replace(/_/g, ' ').toLowerCase()}</div>
+                      <div className="font-num text-[11px] text-slate-400 mt-0.5">{t.nctId}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {fda && (
+              <div className="mt-6 pt-5 border-t border-edge">
+                <h4 className="text-sm font-semibold text-ink mb-2">OpenFDA adverse-event reports — {fda.drug}</h4>
+                <p className="text-xs text-sub mb-3">{fmtInt(fda.totalReports)} total FAERS reports{fda.seriousCount != null ? `, ${fmtInt(fda.seriousCount)} flagged serious` : ''}. Most frequently reported reactions:</p>
+                <div className="flex flex-wrap gap-2">
+                  {fda.topReactions.map((r, i) => (
+                    <span key={i} className="font-num text-[11px] px-2 py-1 rounded bg-slate-50 border border-edge text-sub">{String(r.term || '').toLowerCase()} <span className="text-slate-400">· {fmtInt(r.count)}</span></span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </details>
+      );
+    }
+
+    /* ============================================================
+       DISCLAIMER
+    ============================================================ */
+    function Disclaimer({ text, limitations }) {
+      return (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
+          {limitations && (
+            <div className="mb-4">
+              <h4 className="text-sm font-semibold text-amber-900 mb-1">Data limitations</h4>
+              <p className="text-sm text-amber-800 leading-relaxed">{limitations}</p>
+            </div>
+          )}
+          <div className="flex items-start gap-2">
+            <span className="text-warning mt-0.5 flex-shrink-0"><Icon name="alert" className="w-4 h-4" /></span>
+            <p className="text-xs text-amber-800 leading-relaxed">{text || 'This synthesis is for informational purposes only and does not constitute medical advice. Consult a qualified healthcare provider for any medical decisions.'}</p>
+          </div>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       ERROR / NO-DATA STATES
+    ============================================================ */
+    function ErrorState({ title, message, onRetry, suggestions, onPick }) {
+      return (
+        <div className="max-w-2xl mx-auto mt-10 bg-white rounded-2xl border border-edge shadow-card p-8 text-center fade-up">
+          <div className="w-12 h-12 mx-auto rounded-full bg-amber-50 text-warning flex items-center justify-center mb-4"><Icon name="alert" className="w-6 h-6" /></div>
+          <h3 className="font-display text-xl text-ink mb-2">{title}</h3>
+          <p className="text-sm text-sub leading-relaxed max-w-md mx-auto">{message}</p>
+          {suggestions && suggestions.length > 0 && (
+            <div className="mt-5 flex flex-wrap justify-center gap-2">
+              {suggestions.map((s) => (
+                <button key={s} onClick={() => onPick && onPick(s)} className="px-3 py-1.5 rounded-full border border-edge bg-white text-xs font-medium text-sub hover:border-accent hover:text-primary transition">{s}</button>
+              ))}
+            </div>
+          )}
+          {onRetry && <button onClick={onRetry} className="mt-6 h-10 px-5 rounded-lg bg-primary text-white text-sm font-semibold hover:bg-blue-800 transition">Try again</button>}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       ABOUT
+    ============================================================ */
+    function About() {
+      return (
+        <details className="bg-white rounded-xl border border-edge shadow-card overflow-hidden group">
+          <summary className="flex items-center justify-between px-6 py-4 select-none">
+            <div className="flex items-center gap-2"><Icon name="info" className="w-5 h-5 text-primary" /><span className="font-display text-lg text-ink">About ClinicalLens &amp; our methodology</span></div>
+            <Icon name="chevron" className="w-5 h-5 text-sub transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="px-6 pb-6 border-t border-edge pt-5 text-sm text-sub leading-relaxed space-y-3">
+            <p>ClinicalLens queries public biomedical databases live and uses Claude to synthesize the results into a sourced, plain-language statistical summary. It works for <span className="font-medium text-ink">any</span> drug, disease, condition, or treatment — it is a general-purpose evidence search tool.</p>
+            <div>
+              <span className="font-semibold text-ink">Data sources (all free, public APIs):</span>
+              <ul className="list-disc ml-5 mt-1 space-y-1">
+                <li><span className="font-medium text-ink">PubMed</span> via NCBI E-utilities — peer-reviewed literature.</li>
+                <li><span className="font-medium text-ink">ClinicalTrials.gov</span> (v2 API) — registered trials.</li>
+                <li><span className="font-medium text-ink">OpenFDA</span> (FAERS) — post-market adverse-event reports for named drugs.</li>
+              </ul>
+            </div>
+            <p><span className="font-semibold text-ink">Accuracy guardrails:</span> The synthesis model is instructed to cite only PMIDs and NCT numbers present in the retrieved data, never to invent statistics, to always show study quality and sample size, and to communicate uncertainty using ranges. Every number on this page links back to its source. Publication-timeline counts are computed directly from the returned records.</p>
+            <p><span className="font-semibold text-ink">Privacy &amp; keys:</span> Claude requests are proxied through a small serverless backend, so the Anthropic API key stays on the server and is never exposed to your browser.</p>
+            <p className="text-xs text-slate-400">ClinicalLens is an informational tool and is not a substitute for professional medical advice.</p>
+          </div>
+        </details>
+      );
+    }
+
+    function Section({ title, subtitle, children, icon }) {
+      return (
+        <section className="fade-up">
+          <div className="mb-4">
+            <h2 className="font-display text-2xl text-ink flex items-center gap-2">{icon && <Icon name={icon} className="w-5 h-5 text-primary" />}{title}</h2>
+            {subtitle && <p className="text-sm text-sub mt-1">{subtitle}</p>}
+          </div>
+          {children}
+        </section>
+      );
+    }
+
+    /* ============================================================
+       RESULTS DASHBOARD
+    ============================================================ */
+    function Dashboard({ query, synthesis, raw }) {
+      const timeline = (synthesis.timelineData && synthesis.timelineData.length >= 2) ? synthesis.timelineData : raw.computedTimeline;
+      const stats = synthesis.keyStatistics || [];
+      return (
+        <div className="space-y-10 mt-8">
+          <section className="fade-up">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <div className="text-xs font-medium uppercase tracking-wide text-sub mb-1">Evidence synthesis for</div>
+                <h1 className="font-display text-3xl sm:text-4xl text-ink leading-tight">{query}</h1>
+              </div>
+              <EvidenceBadge strength={synthesis.evidenceStrength} />
+            </div>
+            <p className="font-display text-lg sm:text-xl text-ink leading-relaxed mt-4 max-w-3xl">{synthesis.toplineSummary}</p>
+            {synthesis.evidenceRationale && <p className="text-sm text-sub mt-2"><span className="font-semibold">Why this rating: </span>{synthesis.evidenceRationale}</p>}
+            {(raw.pubmed.count + raw.trials.count) < 5 && (
+              <div className="mt-4 inline-flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-sm text-danger">
+                <Icon name="alert" className="w-4 h-4" /> Very limited evidence base — interpret with caution.
+              </div>
+            )}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
+              <StatCard label="Studies Found" value={fmtInt(synthesis.totalStudiesFound != null ? synthesis.totalStudiesFound : raw.pubmed.totalAvailable)} icon="book" />
+              <StatCard label="Clinical Trials" value={fmtInt(synthesis.totalTrialsFound != null ? synthesis.totalTrialsFound : raw.trials.count)} icon="flask" />
+              <StatCard label="Est. Patients Studied" value={fmtInt(synthesis.totalPatientsAcrossStudies)} icon="users" />
+            </div>
+          </section>
+
+          {stats.length > 0 && (
+            <Section title="Key statistics" subtitle="Each figure is traceable to its source. The left border signals study quality at a glance." icon="search">
+              <div className="grid md:grid-cols-2 gap-5">{stats.map((s, i) => <KeyStatisticCard key={i} stat={s} />)}</div>
+            </Section>
+          )}
+
+          <Section title="Research timeline" subtitle="Publications per year — shows whether research interest is growing or flat.">
+            <div className="bg-white rounded-xl border border-edge shadow-card p-5"><ResearchTimeline data={timeline} /></div>
+          </Section>
+
+          <Section title="Clinical trial pipeline" subtitle="Phase breakdown and the registered trials behind it." icon="flask">
+            <TrialPipeline trials={raw.trials.studies} outcomesByPhase={synthesis.outcomesByPhase} />
+          </Section>
+
+          <Section title="Two perspectives">
+            <PatientResearcherPanel patient={synthesis.patientConsiderations} researcher={synthesis.researcherNotes} />
+          </Section>
+
+          <KnowledgeGaps gaps={synthesis.knowledgeGaps} />
+          <Disclaimer text={synthesis.disclaimer} limitations={synthesis.dataLimitations} />
+          <SourcesPanel papers={raw.pubmed.papers} trials={raw.trials.studies} fetchedAt={raw.fetchedAt} fda={raw.fda} />
+          <About />
+        </div>
+      );
+    }
+
+    /* ============================================================
+       APP
+    ============================================================ */
+    const INITIAL_STEPS = [
+      { label: 'Parsing your query with AI', status: 'pending', detail: '' },
+      { label: 'Searching PubMed', status: 'pending', detail: '' },
+      { label: 'Searching ClinicalTrials.gov & OpenFDA', status: 'pending', detail: '' },
+      { label: 'Running statistical synthesis', status: 'pending', detail: '' },
+    ];
+
+    function App() {
+      const [phase, setPhase] = useState('idle'); // idle | loading | done | nodata | error
+      const [steps, setSteps] = useState(INITIAL_STEPS);
+      const [result, setResult] = useState(null);
+      const [error, setError] = useState(null);
+      const [query, setQuery] = useState('');
+      const lastQuery = useRef('');
+
+      const updateStep = useCallback((idx, status, detail) => {
+        setSteps((prev) => prev.map((s, i) => i === idx ? { ...s, status, detail: detail !== undefined ? detail : s.detail } : s));
+      }, []);
+
+      const runSearch = useCallback(async (raw) => {
+        lastQuery.current = raw;
+        setQuery(raw);
+        setError(null);
+        setResult(null);
+        setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'pending', detail: '' })));
+        setPhase('loading');
+
+        try {
+          updateStep(0, 'active');
+          const parsed = await parseQuery(raw);
+          if (!parsed || !parsed.condition) {
+            setPhase('error');
+            setError({ title: 'Could not understand that query', message: 'Try naming a specific condition, drug, or treatment — for example a disease name or a medication.' });
+            return;
+          }
+          updateStep(0, 'done', parsed.condition + (parsed.drug ? ` · ${parsed.drug}` : ''));
+
+          updateStep(1, 'active');
+          updateStep(2, 'active');
+          const pubmedP = fetchPubMed(parsed)
+            .then((r) => { updateStep(1, 'done', `${fmtInt(r.totalAvailable)} studies found`); return r; })
+            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '' }; });
+          const trialsP = fetchTrials(parsed).catch(() => ({ studies: [], count: 0 }));
+          const fdaP = fetchFDA(parsed).catch(() => null);
+
+          const [pm, ct, fda] = await Promise.all([pubmedP, trialsP, fdaP]);
+          updateStep(2, 'done', `${fmtInt(ct.count)} trials${fda ? ` · OpenFDA: ${fmtInt(fda.totalReports)} reports` : ''}`);
+
+          if (pm.count === 0 && ct.studies.length === 0) { setPhase('nodata'); return; }
+
+          const computedTimeline = computeTimeline(pm.papers);
+          updateStep(3, 'active');
+          const synthesis = await synthesizeData(parsed, pm, ct, fda, computedTimeline);
+          updateStep(3, 'done');
+
+          const fetchedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+          setResult({ synthesis, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fetchedAt } });
+          setPhase('done');
+        } catch (e) {
+          console.error(e);
+          setPhase('error');
+          setError({ title: 'Something went wrong', message: e.message || 'An unexpected error occurred while building the synthesis.' });
+        }
+      }, [updateStep]);
+
+      const busy = phase === 'loading';
+      const showHero = phase !== 'done';
+
+      return (
+        <div className="min-h-screen">
+          <header className="sticky top-0 z-30 bg-canvas/85 backdrop-blur border-b border-edge">
+            <div className="max-w-[1200px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+              <button onClick={() => { setPhase('idle'); setResult(null); setError(null); }} className="flex items-center gap-2.5">
+                <span className="w-9 h-9 rounded-lg bg-primary text-white flex items-center justify-center shadow-card"><Icon name="search" className="w-5 h-5" /></span>
+                <span className="font-display text-xl text-ink">Clinical<span className="text-primary">Lens</span></span>
+              </button>
+              <span className="hidden sm:inline text-xs font-medium text-sub bg-white border border-edge px-3 py-1.5 rounded-full">Live · PubMed · ClinicalTrials.gov · OpenFDA</span>
+            </div>
+          </header>
+
+          <main className="max-w-[1200px] mx-auto px-4 sm:px-6 pb-20">
+            {showHero && (
+              <div className={`${phase === 'idle' ? 'pt-16 sm:pt-24' : 'pt-10'} pb-2 transition-all`}>
+                {phase === 'idle' && (
+                  <div className="text-center mb-8 fade-up">
+                    <h1 className="font-display text-4xl sm:text-5xl text-ink leading-tight">A clearer lens on clinical evidence</h1>
+                    <p className="text-base sm:text-lg text-sub mt-4 max-w-2xl mx-auto leading-relaxed">Type any condition, drug, or treatment. ClinicalLens pulls live data from PubMed, ClinicalTrials.gov, and OpenFDA, then synthesizes a sourced, statistically honest summary — every number traceable to its source.</p>
+                  </div>
+                )}
+                <div className="max-w-3xl mx-auto"><SearchBar onSearch={runSearch} busy={busy} /></div>
+              </div>
+            )}
+
+            {phase === 'loading' && <LoadingState steps={steps} />}
+            {phase === 'error' && error && <ErrorState title={error.title} message={error.message} onRetry={() => runSearch(lastQuery.current)} />}
+            {phase === 'nodata' && (
+              <ErrorState
+                title="Limited published data on this topic"
+                message="We found little or no indexed evidence for that query. This may mean it is very rare, newly emerging, or primarily researched in non-English literature. Try a broader term or one of these:"
+                suggestions={EXAMPLE_CHIPS} onPick={runSearch} />
+            )}
+            {phase === 'done' && result && <Dashboard query={query} synthesis={result.synthesis} raw={result.raw} />}
+            {phase === 'idle' && <div className="max-w-3xl mx-auto mt-16"><About /></div>}
+          </main>
+
+          <footer className="border-t border-edge">
+            <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6 text-xs text-sub flex flex-col sm:flex-row items-center justify-between gap-2">
+              <span>ClinicalLens · Live data from PubMed · ClinicalTrials.gov · OpenFDA · Synthesis by Claude</span>
+              <span>For informational purposes only — not medical advice.</span>
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

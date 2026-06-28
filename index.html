@@ -94,8 +94,10 @@
     const CT_API = 'https://clinicaltrials.gov/api/v2/studies';
     const FDA_API = 'https://api.fda.gov/drug/event.json';
 
-    const PUBMED_FETCH = 200;   // pull a deep pool, then rank by study quality (not recency)
-    const ABSTRACT_TOP = 15;    // fetch full abstracts for the N highest-quality studies
+    const PUBMED_FETCH = 200;             // pull a deep pool, then rank by study quality (not recency)
+    const ABSTRACT_TOP = 20;              // fetch full abstracts for the N highest-quality studies
+    const ABSTRACT_BUDGET = 48000;        // chars of abstract text fed to the synthesis model (~20 abstracts)
+    const PROFILE_ABSTRACT_BUDGET = 22000;// chars of abstract text fed to the profile model
 
     const EXAMPLE_CHIPS = [
       'Multiple sclerosis',
@@ -305,7 +307,7 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       if (ids.length === 0 && parsed.condition && parsed.condition !== parsed.pubmedQuery) {
         ({ ids, total } = await pubmedSearch(parsed.condition, sortMode));
       }
-      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} };
+      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} };
 
       const sumRes = await ncbiFetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
       const sumJson = await sumRes.json();
@@ -335,13 +337,14 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       const typeCounts = papers.reduce((m, p) => { m[p.category] = (m[p.category] || 0) + 1; return m; }, {});
 
       let abstracts = '';
+      let abstractPmids = [];
       try {
         const topIds = papers.slice(0, ABSTRACT_TOP).map((p) => p.pmid);
         const absRes = await ncbiFetch(`${EUTILS}/efetch.fcgi?db=pubmed&id=${topIds.join(',')}&rettype=abstract&retmode=text`);
-        if (absRes.ok) abstracts = await absRes.text();
+        if (absRes.ok) { abstracts = await absRes.text(); abstractPmids = topIds; }
       } catch (e) { /* abstracts are best-effort */ }
 
-      return { ids, papers, count: papers.length, totalAvailable: total, abstracts, typeCounts };
+      return { ids, papers, count: papers.length, totalAvailable: total, abstracts, abstractPmids, typeCounts };
     }
 
     function bucketPhase(phase) {
@@ -450,6 +453,9 @@ Your job is to produce a rigorous, sourced statistical synthesis. You must:
    real-world data, and systematic reviews
 6. Note sample sizes — small studies (n<50) must be flagged as preliminary
 7. Communicate uncertainty honestly using plain language
+8. Attribute a specific numeric statistic ONLY to a PMID whose full abstract text is provided (see
+   fullAbstractsProvidedForPmids). For papers where you have only the title, you may reference them as
+   context but must NOT attach extracted numbers to them, and must never infer a statistic you cannot see
 
 Return ONLY a JSON object with this exact structure:
 {
@@ -494,9 +500,10 @@ Return ONLY a JSON object with this exact structure:
         pubmed: {
           totalAvailableInPubMed: pm ? pm.totalAvailable : 0,
           returnedForAnalysis: pm ? pm.count : 0,
+          fullAbstractsProvidedForPmids: pm ? pm.abstractPmids : [],
           studyTypeCounts: pm ? pm.typeCounts : {},
           papers: pm ? pm.papers.slice(0, 60).map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, studyType: p.category })) : [],
-          abstractsHighestQuality: pm ? (pm.abstracts || '').slice(0, 4500) : '',
+          abstractsHighestQuality: pm ? (pm.abstracts || '').slice(0, ABSTRACT_BUDGET) : '',
         },
         clinicalTrials: {
           totalMatching: ct ? ct.count : 0,
@@ -506,8 +513,10 @@ Return ONLY a JSON object with this exact structure:
         precomputedPublicationTimeline: timeline,
       };
       const user = `Here is the raw data retrieved live from the source APIs. Produce the synthesis JSON. ` +
-        `Cite only PMIDs and NCT numbers that appear in this data. Use the precomputedPublicationTimeline ` +
-        `values for timelineData (counted directly from the returned PubMed records).\n\n` +
+        `Cite only PMIDs and NCT numbers that appear in this data. Attach an extracted numeric statistic ONLY ` +
+        `to a PMID listed in fullAbstractsProvidedForPmids (those are the papers whose abstract text is included ` +
+        `in abstractsHighestQuality); for title-only papers do not invent or attach numbers. Use the ` +
+        `precomputedPublicationTimeline values for timelineData (counted directly from the returned PubMed records).\n\n` +
         `Keep the JSON compact: include the 6-8 most important keyStatistics, at most 8 activeTrials, at most ` +
         `6 items in each list field, and keep every text field to 1-2 sentences. Do not pad.\n\n` +
         '<raw_data>\n' + JSON.stringify(payload) + '\n</raw_data>';
@@ -533,6 +542,7 @@ GUARDRAILS:
 - No promotional framing. Side effects and limitations get equal weight to benefits.
 - The "Plain" version must be just as accurate as the "Technical" one — only the vocabulary differs.
 - sourceIds must only contain PMID or NCT numbers that appear in the retrieved data.
+- Attach numeric or specific evidence details only to PMIDs whose abstract text is provided (see fullAbstractsProvidedForPmids); for title-only papers, do not fabricate specifics.
 
 Block schemas (include only the blocks requested in the user message):
 "diseaseOverview": { "plainSummary": "3-4 sentences a smart non-scientist understands", "whatGoesWrong": "the core biological malfunction in high-school-biology terms", "mechanismDeep": "deeper mechanism (cell types, pathways, genetic/autoimmune basis, what's still unknown)", "whoGetsIt": "epidemiology in plain terms", "howDiagnosed": "tests/biomarkers/criteria; note diagnostic delay if relevant", "currentUnderstanding": "most current understanding; is the field evolving/contested?", "sourceIds": [] }
@@ -547,7 +557,8 @@ Block schemas (include only the blocks requested in the user message):
       const payload = {
         searchType, condition: parsed.condition, drug: parsed.drug, topic: parsed.plainLanguageTopic,
         pubmed: pm ? pm.papers.slice(0, 40).map((p) => ({ pmid: p.pmid, title: p.title, year: p.year, studyType: p.category })) : [],
-        abstracts: pm ? (pm.abstracts || '').slice(0, 4000) : '',
+        fullAbstractsProvidedForPmids: pm ? pm.abstractPmids : [],
+        abstracts: pm ? (pm.abstracts || '').slice(0, PROFILE_ABSTRACT_BUDGET) : '',
         trials: ct ? ct.studies.slice(0, 15).map((s) => ({ nctId: s.nctId, title: s.title, phase: s.phase, status: s.status })) : [],
         openFDA: fda ? { drug: fda.drug, totalReports: fda.totalReports, topReactions: fda.topReactions.slice(0, 8) } : null,
       };
@@ -560,7 +571,7 @@ Block schemas (include only the blocks requested in the user message):
     // Full single-topic pipeline (used for comparison arms; the single-query path
     // below runs the same steps with granular progress).
     async function gather(parsed, sort) {
-      const emptyPM = { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} };
+      const emptyPM = { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} };
       const [pm, ct, fda] = await Promise.all([
         fetchPubMed(parsed, sort).catch(() => emptyPM),
         fetchTrials(parsed).catch(() => ({ studies: [], count: 0 })),
@@ -1458,10 +1469,16 @@ Block schemas (include only the blocks requested in the user message):
               </div>
             )}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
-              <StatCard label="Studies Found" value={fmtInt(synthesis.totalStudiesFound != null ? synthesis.totalStudiesFound : raw.pubmed.totalAvailable)} icon="book" />
+              <StatCard label="Studies Found" value={fmtInt(raw.pubmed.totalAvailable || synthesis.totalStudiesFound)} icon="book" />
               <StatCard label="Clinical Trials" value={fmtInt(synthesis.totalTrialsFound != null ? synthesis.totalTrialsFound : raw.trials.count)} icon="flask" />
               <StatCard label="Est. Patients Studied" value={fmtInt(synthesis.totalPatientsAcrossStudies)} icon="users" />
             </div>
+            <p className="text-xs text-sub mt-3 max-w-3xl leading-relaxed">
+              {raw.pubmed.count >= raw.pubmed.totalAvailable
+                ? `Analyzed all ${fmtInt(raw.pubmed.count)} matching PubMed records`
+                : `Analyzed the top ${fmtInt(raw.pubmed.count)} of ${fmtInt(raw.pubmed.totalAvailable)} matching PubMed records, ranked by study quality`}
+              {(raw.pubmed.abstractPmids && raw.pubmed.abstractPmids.length > 0) ? `, with full abstracts read for the ${fmtInt(raw.pubmed.abstractPmids.length)} strongest` : ''}. This is a rapid evidence scan, not a systematic review — see all sources below.
+            </p>
             <div className="mt-4 flex items-center gap-2 text-xs text-sub">
               <span>Ranking:</span>
               <div className="inline-flex rounded-lg border border-edge overflow-hidden">
@@ -1551,6 +1568,9 @@ Block schemas (include only the blocks requested in the user message):
                 </div>
               ))}
             </div>
+            <p className="text-[11px] text-sub mt-2 leading-relaxed">
+              {raw.pubmed.count >= raw.pubmed.totalAvailable ? `All ${fmtInt(raw.pubmed.count)} records` : `Top ${fmtInt(raw.pubmed.count)} of ${fmtInt(raw.pubmed.totalAvailable)} records`} analyzed · {fmtInt(raw.pubmed.abstractPmids ? raw.pubmed.abstractPmids.length : 0)} full abstracts read
+            </p>
           </div>
 
           {stats.length > 0 && <div className="space-y-4">{stats.map((s, i) => <KeyStatisticCard key={i} stat={s} />)}</div>}
@@ -1661,7 +1681,7 @@ Block schemas (include only the blocks requested in the user message):
           updateStep(1, 'active'); updateStep(2, 'active');
           const pubmedP = fetchPubMed(parsed, sort)
             .then((r) => { updateStep(1, 'done', `${fmtInt(r.totalAvailable)} studies, ranked by quality`); return r; })
-            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', typeCounts: {} }; });
+            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} }; });
           const trialsP = fetchTrials(parsed).catch(() => ({ studies: [], count: 0 }));
           const fdaP = fetchFDA(parsed).catch(() => null);
 

@@ -98,6 +98,9 @@
     const ABSTRACT_TOP = 20;              // fetch full abstracts for the N highest-quality studies
     const ABSTRACT_BUDGET = 48000;        // chars of abstract text fed to the synthesis model (~20 abstracts)
     const PROFILE_ABSTRACT_BUDGET = 22000;// chars of abstract text fed to the profile model
+    const FULLTEXT_TOP = 3;               // open-access full texts to pull for the highest-quality papers
+    const FULLTEXT_BUDGET = 15000;        // chars of full text per article fed to the model
+    const TIMELINE_YEARS = 30;            // span of the true full-corpus publications-per-year histogram
 
     const EXAMPLE_CHIPS = [
       'Multiple sclerosis',
@@ -288,9 +291,9 @@ For comparisons, share the same condition across both arms and vary the drug/tre
     /* ============================================================
        STEP 2 — DATA FETCHERS (public APIs, run client-side)
     ============================================================ */
-    async function pubmedSearch(term, sort) {
+    async function pubmedSearch(term, sort, retmax) {
       const s = sort ? `&sort=${enc(sort)}` : '';
-      const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=${PUBMED_FETCH}&retmode=json${s}`;
+      const url = `${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(term)}&retmax=${retmax || PUBMED_FETCH}&retmode=json${s}`;
       const res = await ncbiFetch(url);
       if (!res.ok) throw new Error('PubMed search failed');
       const json = await res.json();
@@ -299,15 +302,71 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       return { ids, total };
     }
 
+    // Open-access full text (PubMed Central) for a few top papers — far richer than
+    // abstracts (methods, full results, adverse events, limitations). Best-effort.
+    async function fetchFullText(pmids) {
+      if (!pmids || !pmids.length) return [];
+      try {
+        const el = await ncbiFetch(`${EUTILS}/elink.fcgi?dbfrom=pubmed&db=pmc&id=${pmids.join(',')}&retmode=json`);
+        if (!el.ok) return [];
+        const ej = await el.json();
+        const ls = (ej.linksets && ej.linksets[0]) || {};
+        const pmcLinks = (((ls.linksetdbs || []).find((d) => d.dbto === 'pmc') || {}).links) || [];
+        if (!pmcLinks.length) return [];
+        const fx = await ncbiFetch(`${EUTILS}/efetch.fcgi?db=pmc&id=${pmcLinks.slice(0, FULLTEXT_TOP).join(',')}&retmode=xml`);
+        if (!fx.ok) return [];
+        const doc = new DOMParser().parseFromString(await fx.text(), 'text/xml');
+        const out = [];
+        Array.from(doc.querySelectorAll('article')).forEach((a) => {
+          const pmidEl = a.querySelector('article-id[pub-id-type="pmid"]');
+          const body = a.querySelector('body');
+          const text = body ? body.textContent.replace(/\s+/g, ' ').trim() : '';
+          if (text) out.push({ pmid: pmidEl ? pmidEl.textContent : null, text: text.slice(0, FULLTEXT_BUDGET) });
+        });
+        return out;
+      } catch (e) { return []; }
+    }
+
+    // True full-corpus publications-per-year via count-only queries (one per year).
+    // Reflects ALL matching publications, not the relevance-ranked sample. Runs
+    // concurrently with the AI calls, so it adds essentially no wall-clock time.
+    async function fetchYearHistogram(baseTerm) {
+      if (!baseTerm) return null;
+      const now = new Date().getFullYear();
+      const years = [];
+      for (let y = now - (TIMELINE_YEARS - 1); y <= now; y++) years.push(y);
+      const counts = await Promise.all(years.map(async (y) => {
+        try {
+          const r = await ncbiFetch(`${EUTILS}/esearch.fcgi?db=pubmed&term=${enc(`(${baseTerm}) AND ${y}[pdat]`)}&retmax=0&retmode=json`);
+          if (!r.ok) return { year: y, studyCount: 0 };
+          const j = await r.json();
+          return { year: y, studyCount: parseInt((j.esearchresult && j.esearchresult.count) || 0, 10) || 0 };
+        } catch (e) { return { year: y, studyCount: 0 }; }
+      }));
+      const firstNZ = counts.findIndex((d) => d.studyCount > 0);
+      const arr = firstNZ > 0 ? counts.slice(firstNZ) : counts;
+      return arr.some((d) => d.studyCount > 0) ? arr : null;
+    }
+
+    const EMPTY_PM = { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], fullTexts: [], typeCounts: {}, highEvidenceCount: 0 };
+
     async function fetchPubMed(parsed, sort) {
-      // "Best Match" (relevance) by default surfaces foundational + recent work,
-      // countering the recency bias of date-sorted results.
-      const sortMode = sort || 'relevance';
-      let { ids, total } = await pubmedSearch(parsed.pubmedQuery || parsed.condition || '', sortMode);
-      if (ids.length === 0 && parsed.condition && parsed.condition !== parsed.pubmedQuery) {
-        ({ ids, total } = await pubmedSearch(parsed.condition, sortMode));
+      const sortMode = sort || 'relevance';   // Best Match surfaces foundational + recent work
+      const baseTerm = parsed.pubmedQuery || parsed.condition || '';
+      let main = await pubmedSearch(baseTerm, sortMode, PUBMED_FETCH);
+      if (main.ids.length === 0 && parsed.condition && parsed.condition !== baseTerm) {
+        main = await pubmedSearch(parsed.condition, sortMode, PUBMED_FETCH);
       }
-      if (ids.length === 0) return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} };
+      const total = main.total;
+      if (main.ids.length === 0) return { ...EMPTY_PM };
+
+      // Guaranteed high-evidence pull: systematic reviews / meta-analyses / guidelines,
+      // merged in front so the strongest evidence is captured and read first even when
+      // it falls outside the top-200 Best Match.
+      let hiEv = { ids: [] };
+      try { hiEv = await pubmedSearch(`(${baseTerm}) AND (systematic[sb] OR meta-analysis[pt] OR guideline[pt])`, 'relevance', 60); } catch (e) {}
+      const mainSet = new Set(main.ids);
+      const ids = uniq([...hiEv.ids, ...main.ids]).slice(0, 240);
 
       const sumRes = await ncbiFetch(`${EUTILS}/esummary.fcgi?db=pubmed&id=${ids.join(',')}&retmode=json`);
       const sumJson = await sumRes.json();
@@ -334,7 +393,9 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       // Rank by evidence tier first, recency second — the strongest evidence leads.
       papers.sort((a, b) => (a.tier - b.tier) || ((b.year || 0) - (a.year || 0)));
 
-      const typeCounts = papers.reduce((m, p) => { m[p.category] = (m[p.category] || 0) + 1; return m; }, {});
+      // The pyramid/charts use the representative relevance sample only — NOT the
+      // deliberate high-evidence over-sample, which would inflate the review count.
+      const typeCounts = papers.filter((p) => mainSet.has(p.pmid)).reduce((m, p) => { m[p.category] = (m[p.category] || 0) + 1; return m; }, {});
 
       let abstracts = '';
       let abstractPmids = [];
@@ -344,7 +405,10 @@ For comparisons, share the same condition across both arms and vary the drug/tre
         if (absRes.ok) { abstracts = await absRes.text(); abstractPmids = topIds; }
       } catch (e) { /* abstracts are best-effort */ }
 
-      return { ids, papers, count: papers.length, totalAvailable: total, abstracts, abstractPmids, typeCounts };
+      // Open-access full text for the top few highest-quality papers.
+      const fullTexts = await fetchFullText(papers.slice(0, FULLTEXT_TOP).map((p) => p.pmid));
+
+      return { ids, papers, count: main.ids.length, totalAvailable: total, abstracts, abstractPmids, fullTexts, typeCounts, highEvidenceCount: hiEv.ids.length };
     }
 
     function bucketPhase(phase) {
@@ -506,10 +570,11 @@ Return ONLY a JSON object with this exact structure:
         pubmed: {
           totalAvailableInPubMed: pm ? pm.totalAvailable : 0,
           returnedForAnalysis: pm ? pm.count : 0,
-          fullAbstractsProvidedForPmids: pm ? pm.abstractPmids : [],
+          fullAbstractsProvidedForPmids: pm ? uniq([...(pm.abstractPmids || []), ...((pm.fullTexts || []).map((f) => f.pmid).filter(Boolean))]) : [],
           studyTypeCounts: pm ? pm.typeCounts : {},
           papers: pm ? pm.papers.slice(0, 60).map((p) => ({ pmid: p.pmid, title: p.title, journal: p.journal, year: p.year, studyType: p.category })) : [],
           abstractsHighestQuality: pm ? (pm.abstracts || '').slice(0, ABSTRACT_BUDGET) : '',
+          openAccessFullText: pm ? (pm.fullTexts || []).map((f) => ({ pmid: f.pmid, text: f.text })) : [],
         },
         clinicalTrials: {
           totalMatching: ct ? ct.count : 0,
@@ -520,9 +585,11 @@ Return ONLY a JSON object with this exact structure:
       };
       const user = `Here is the raw data retrieved live from the source APIs. Produce the synthesis JSON. ` +
         `Cite only PMIDs and NCT numbers that appear in this data. Attach an extracted numeric statistic ONLY ` +
-        `to a PMID listed in fullAbstractsProvidedForPmids (those are the papers whose abstract text is included ` +
-        `in abstractsHighestQuality); for title-only papers do not invent or attach numbers. Use the ` +
-        `precomputedPublicationTimeline values for timelineData (counted directly from the returned PubMed records).\n\n` +
+        `to a PMID listed in fullAbstractsProvidedForPmids (the papers whose abstract text is in ` +
+        `abstractsHighestQuality, or whose complete article text is in openAccessFullText); for title-only ` +
+        `papers do not invent or attach numbers. openAccessFullText contains complete article text (methods, ` +
+        `full results, confidence intervals, adverse events, limitations) for a few top papers — prefer it over ` +
+        `the abstract for those PMIDs. Use the precomputedPublicationTimeline values for timelineData.\n\n` +
         `Keep the JSON compact: include the 6-8 most important keyStatistics, at most 8 activeTrials, at most ` +
         `6 items in each list field, and keep every text field to 1-2 sentences. Do not pad.\n\n` +
         '<raw_data>\n' + JSON.stringify(payload) + '\n</raw_data>';
@@ -563,8 +630,9 @@ Block schemas (include only the blocks requested in the user message):
       const payload = {
         searchType, condition: parsed.condition, drug: parsed.drug, topic: parsed.plainLanguageTopic,
         pubmed: pm ? pm.papers.slice(0, 40).map((p) => ({ pmid: p.pmid, title: p.title, year: p.year, studyType: p.category })) : [],
-        fullAbstractsProvidedForPmids: pm ? pm.abstractPmids : [],
+        fullAbstractsProvidedForPmids: pm ? uniq([...(pm.abstractPmids || []), ...((pm.fullTexts || []).map((f) => f.pmid).filter(Boolean))]) : [],
         abstracts: pm ? (pm.abstracts || '').slice(0, PROFILE_ABSTRACT_BUDGET) : '',
+        openAccessFullText: pm ? (pm.fullTexts || []).map((f) => ({ pmid: f.pmid, text: (f.text || '').slice(0, 12000) })) : [],
         trials: ct ? ct.studies.slice(0, 15).map((s) => ({ nctId: s.nctId, title: s.title, phase: s.phase, status: s.status })) : [],
         openFDA: fda ? { drug: fda.drug, totalReports: fda.totalReports, topReactions: fda.topReactions.slice(0, 8) } : null,
       };
@@ -577,9 +645,8 @@ Block schemas (include only the blocks requested in the user message):
     // Full single-topic pipeline (used for comparison arms; the single-query path
     // below runs the same steps with granular progress).
     async function gather(parsed, sort) {
-      const emptyPM = { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} };
       const [pm, ct, fda] = await Promise.all([
-        fetchPubMed(parsed, sort).catch(() => emptyPM),
+        fetchPubMed(parsed, sort).catch(() => ({ ...EMPTY_PM })),
         fetchTrials(parsed).catch(() => ({ studies: [], count: 0 })),
         fetchFDA(parsed).catch(() => null),
       ]);
@@ -1212,7 +1279,7 @@ Block schemas (include only the blocks requested in the user message):
             <div>
               <span className="font-semibold text-ink">Data sources (all free, public APIs):</span>
               <ul className="list-disc ml-5 mt-1 space-y-1">
-                <li><span className="font-medium text-ink">PubMed</span> via NCBI E-utilities — up to 200 records, ranked by study quality (systematic reviews & RCTs first), not just recency.</li>
+                <li><span className="font-medium text-ink">PubMed</span> via NCBI E-utilities — up to 200 records plus a guaranteed pull of systematic reviews, meta-analyses & guidelines, ranked by study quality; open-access full text is read for the top papers, and the research timeline uses true full-corpus counts per year.</li>
                 <li><span className="font-medium text-ink">ClinicalTrials.gov</span> (v2 API) — registered trials.</li>
                 <li><span className="font-medium text-ink">OpenFDA</span> (FAERS) — post-market adverse-event reports, searched across generic, brand, and substance names.</li>
               </ul>
@@ -1451,8 +1518,8 @@ Block schemas (include only the blocks requested in the user message):
       const effectiveType = searchType === 'ambiguous' ? viewType : (searchType || 'disease');
       const diseaseName = raw.parsed.condition;
       const drugName = raw.parsed.drug || raw.parsed.condition;
-      const timeline = (synthesis.timelineData && synthesis.timelineData.length >= 2) ? synthesis.timelineData : raw.computedTimeline;
-      const allOneYear = raw.pubmed.papers.length > 0 && uniq(raw.pubmed.papers.map((p) => p.year).filter(Boolean)).length <= 1;
+      const timeline = (raw.fullTimeline && raw.fullTimeline.length >= 2) ? raw.fullTimeline : raw.computedTimeline;
+      const allOneYear = (!raw.fullTimeline || raw.fullTimeline.length < 2) && raw.pubmed.papers.length > 0 && uniq(raw.pubmed.papers.map((p) => p.year).filter(Boolean)).length <= 1;
       const stats = synthesis.keyStatistics || [];
       const trials = raw.trials.studies;
       return (
@@ -1519,7 +1586,7 @@ Block schemas (include only the blocks requested in the user message):
           )}
 
           {/* Research timeline */}
-          <Section title="Research timeline" subtitle="Publications per year — shows whether research interest is growing or flat.">
+          <Section title="Research timeline" subtitle="Publications per year across all of PubMed — true full-corpus counts, not a sample of 200. Last 30 years.">
             <div className="bg-white rounded-xl border border-edge shadow-card p-5"><ResearchTimeline data={timeline} allOneYear={allOneYear} onBroaden={onBroaden} /></div>
           </Section>
 
@@ -1686,7 +1753,7 @@ Block schemas (include only the blocks requested in the user message):
           updateStep(1, 'active'); updateStep(2, 'active');
           const pubmedP = fetchPubMed(parsed, sort)
             .then((r) => { updateStep(1, 'done', `${fmtInt(r.totalAvailable)} studies, ranked by quality`); return r; })
-            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ids: [], papers: [], count: 0, totalAvailable: 0, abstracts: '', abstractPmids: [], typeCounts: {} }; });
+            .catch(() => { updateStep(1, 'error', 'unavailable'); return { ...EMPTY_PM }; });
           const trialsP = fetchTrials(parsed).catch(() => ({ studies: [], count: 0 }));
           const fdaP = fetchFDA(parsed).catch(() => null);
 
@@ -1697,13 +1764,14 @@ Block schemas (include only the blocks requested in the user message):
 
           const computedTimeline = computeTimeline(pm.papers);
           updateStep(3, 'active'); updateStep(4, 'active');
-          const [profile, synthesis] = await Promise.all([
+          const [profile, synthesis, fullTimeline] = await Promise.all([
             buildProfile(parsed, searchType, pm, ct, fda).then((p) => { updateStep(3, 'done'); return p; }).catch(() => { updateStep(3, 'error'); return null; }),
             synthesizeData(parsed, pm, ct, fda, computedTimeline).then((s) => { updateStep(4, 'done'); return s; }),
+            fetchYearHistogram(parsed.pubmedQuery || parsed.condition || '').catch(() => null),
           ]);
 
           const fetchedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-          setResult({ synthesis, profile, searchType, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fetchedAt } });
+          setResult({ synthesis, profile, searchType, raw: { pubmed: pm, trials: ct, fda, parsed, computedTimeline, fullTimeline, fetchedAt } });
           setPhase('done');
         } catch (e) {
           console.error(e);

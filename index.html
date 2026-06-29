@@ -456,6 +456,11 @@ Your job is to produce a rigorous, sourced statistical synthesis. You must:
 8. Attribute a specific numeric statistic ONLY to a PMID whose full abstract text is provided (see
    fullAbstractsProvidedForPmids). For papers where you have only the title, you may reference them as
    context but must NOT attach extracted numbers to them, and must never infer a statistic you cannot see
+9. Each plainTitle must be a faithful, FORMAL plain-language restatement of that one statistic — the measured
+   clinical register of a Cochrane plain-language summary, never casual or conversational. For example write
+   "Treatment was associated with a substantially lower relapse rate", NOT "people relapsed about half as
+   often". Use no number that is not already in value, and do not overstate significance or imply causation
+   the study design does not support
 
 Return ONLY a JSON object with this exact structure:
 {
@@ -467,8 +472,9 @@ Return ONLY a JSON object with this exact structure:
   "totalPatientsAcrossStudies": number or null if unknown,
   "keyStatistics": [
     {
-      "label": "statistic name e.g. Complete Remission Rate",
-      "value": "e.g. 23-41%",
+      "plainTitle": "a formal, plain-language headline (<= ~12 words) stating what this statistic means, in the measured clinical register of a Cochrane plain-language summary — accessible but professional, never conversational; contains no number not already in value; reflects statistical significance; uses 'associated with' for observational findings rather than causal language",
+      "label": "the formal statistic name, e.g. Complete Remission Rate",
+      "value": "the precise figure, e.g. 23-41%; append the p-value and/or 95% confidence interval when the source abstract reports them (never invent them)",
       "context": "plain English explanation of what this means",
       "sourceType": "one of: clinical_trial|observational_study|meta_analysis|case_series",
       "sourceIds": ["PMID:12345678", "NCT:12345678"],
@@ -719,12 +725,11 @@ Block schemas (include only the blocks requested in the user message):
       return (
         <div className="bg-white rounded-xl border border-edge shadow-card p-5 fade-up" style={{ borderLeft: `5px solid ${q.color}` }}>
           <div className="flex items-start justify-between gap-3 flex-wrap">
-            <div className="min-w-0">
-              <div className="font-num text-2xl font-bold text-ink leading-tight">{stat.value}</div>
-              <div className="text-sm font-semibold text-primary mt-1">{stat.label}</div>
-            </div>
+            <h3 className="font-display text-lg text-ink leading-snug min-w-0">{stat.plainTitle || stat.label}</h3>
             <QualityBadge quality={stat.studyQuality} />
           </div>
+          <div className="mt-2 inline-flex items-center rounded-md bg-blue-50 border border-blue-100 px-2.5 py-1 font-num text-base font-semibold text-primary">{stat.value}</div>
+          {stat.plainTitle && stat.label && <div className="text-[11px] font-semibold text-sub mt-2 uppercase tracking-wide">{stat.label}</div>}
           {stat.context && <p className="text-sm text-sub mt-3 leading-relaxed">{stat.context}</p>}
           {stat.caveat && (
             <div className="mt-3 flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">

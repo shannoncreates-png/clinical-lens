@@ -1838,6 +1838,16 @@ Block schemas (include only the blocks requested in the user message):
 
       const onSort = useCallback((mode) => { if (mode !== sortMode && lastQuery.current) runSearch(lastQuery.current, { sort: mode }); }, [sortMode, runSearch]);
 
+      // Deep-link auto-run: a static SEO page's "Get freshest data" button links to
+      // /?q=<topic>&run=1, which regenerates that topic live here on the homepage.
+      // Homepage searches always run live and never route to a pre-built page.
+      useEffect(() => {
+        try {
+          const q = new URLSearchParams(window.location.search).get('q');
+          if (q && q.trim()) runSearch(q.trim());
+        } catch (e) {}
+      }, [runSearch]);
+
       const busy = phase === 'loading';
       const showHero = phase !== 'done' && phase !== 'compare';
 

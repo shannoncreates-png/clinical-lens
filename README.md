@@ -8,9 +8,13 @@ by **Claude**. Every statistic links back to its source (PMID / NCT number).
 ## Architecture
 
 ```
-index.html        → the whole frontend (React + Tailwind via CDN, hand-drawn SVG charts)
-api/claude.js     → Vercel serverless function that proxies to the Anthropic API
-server.js         → local dev server (same proxy, for running without the Vercel CLI)
+index.html          → the interactive homepage (React + Tailwind via CDN, SVG charts)
+api/claude.js       → Vercel serverless function that proxies to the Anthropic API
+server.js           → local dev server (same proxy, for running without the Vercel CLI)
+lib/pipeline.mjs    → shared data + AI pipeline (fetchers, prompts, analyzeTopic)
+scripts/generate.mjs→ pre-generates static SEO pages for the curated topics
+scripts/render-page.mjs → renders a result to crawler-first static HTML
+content/topics.json → the curated drug / disease / comparison lists for SEO pages
 ```
 
 The Anthropic API key lives **only on the server** (the `ANTHROPIC_API_KEY` environment
@@ -44,6 +48,33 @@ node server.js              # serves the app + the proxy on http://localhost:300
 Open <http://localhost:3000>.
 
 (Alternatively, `npm i -g vercel && vercel dev` runs the real serverless function locally.)
+
+## SEO pages (pre-generated static content)
+
+The interactive homepage is a client-rendered SPA — great for users, invisible to Google
+per-topic. For search traffic, ClinicalLens **pre-generates crawlable static pages** for a
+curated list of high-traffic topics (`content/topics.json`): `/drug/<slug>/`,
+`/disease/<slug>/`, `/compare/<slug>/`, plus `/drug/`, `/disease/`, `/compare/` index pages
+and a `sitemap.xml`. Each page has SEO titles/meta, JSON-LD structured data, the full
+synthesized content, inline SVG charts, a "Data refreshed on …" line, and a **Get freshest
+data** button that opens the live tool (`/?q=<topic>&run=1`).
+
+Generate them (needs your key + `linkedom`, both local-only — Vercel just serves the files):
+
+```bash
+npm install                          # installs linkedom (devDependency)
+# ANTHROPIC_API_KEY must be set (clinical-lens/.env or environment)
+export SITE_URL="https://your-domain.com"   # optional; used for canonical + sitemap URLs
+npm run generate                     # all topics  (≈ topics × 2 Claude calls — run periodically)
+npm run generate -- --topic metformin  # a single topic
+npm run generate -- --kind drugs        # one list
+```
+
+Then **commit the generated `content/**`, `drug/**`, `disease/**`, `compare/**`,
+`sitemap.xml`, `robots.txt`** and push — Vercel serves them statically (no build step). The
+homepage always regenerates live and never routes to a static page. Re-run periodically (or
+via a GitHub Action / Vercel Cron) to refresh; the static pages are the stable, reproducible
+layer, the homepage is the always-fresh one.
 
 ## Notes
 

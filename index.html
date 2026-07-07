@@ -85,6 +85,9 @@
 
     /* ============================================================
        CONSTANTS
+       NOTE: the data/AI pipeline below (fetchers, prompts, Claude calls) is mirrored
+       in lib/pipeline.mjs, which the Node SEO generator uses. Keep the two in sync so
+       pre-generated pages match the live tool.
     ============================================================ */
     const CLAUDE_PROXY = '/api/claude';
     const MODEL_SYNTH = 'claude-sonnet-4-6';   // quality-critical synthesis

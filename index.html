@@ -419,36 +419,53 @@ For comparisons, share the same condition across both arms and vary the drug/tre
       return 'other';
     }
 
-    async function fetchTrials(parsed) {
+    const ENROLLING_STATUSES = 'RECRUITING|NOT_YET_RECRUITING|ENROLLING_BY_INVITATION|AVAILABLE';
+
+    function mapTrial(s) {
+      const p = s.protocolSection || {};
+      const idm = p.identificationModule || {};
+      const stm = p.statusModule || {};
+      const dsm = p.designModule || {};
+      const oem = p.outcomesModule || {};
+      const phases = dsm.phases || [];
+      return {
+        nctId: idm.nctId,
+        title: idm.briefTitle || '(untitled study)',
+        status: stm.overallStatus || 'UNKNOWN',
+        phase: phases.length ? phases.map((x) => x.replace('PHASE', 'Phase ').replace('EARLY_Phase 1', 'Early Phase 1')).join('/') : 'N/A',
+        bucket: bucketPhase(phases.join('/')),
+        enrollment: (dsm.enrollmentInfo && dsm.enrollmentInfo.count) || null,
+        primaryOutcome: (oem.primaryOutcomes || []).map((o) => o.measure).slice(0, 3).join('; '),
+        startDate: (stm.startDateStruct && stm.startDateStruct.date) || '',
+        completionDate: (stm.completionDateStruct && stm.completionDateStruct.date) || '',
+      };
+    }
+
+    async function ctgovQuery(parsed, extra) {
       const params = new URLSearchParams();
       if (parsed.condition) params.append('query.cond', parsed.condition);
       if (parsed.drug) params.append('query.intr', parsed.drug);
       params.append('pageSize', '30');
       params.append('countTotal', 'true');
+      if (extra) Object.keys(extra).forEach((k) => params.append(k, extra[k]));
       const res = await fetch(`${CT_API}?${params.toString()}`);
       if (!res.ok) throw new Error('ClinicalTrials.gov request failed');
       const json = await res.json();
-      const seen = new Set();
-      const studies = (json.studies || []).map((s) => {
-        const p = s.protocolSection || {};
-        const idm = p.identificationModule || {};
-        const stm = p.statusModule || {};
-        const dsm = p.designModule || {};
-        const oem = p.outcomesModule || {};
-        const phases = dsm.phases || [];
-        return {
-          nctId: idm.nctId,
-          title: idm.briefTitle || '(untitled study)',
-          status: stm.overallStatus || 'UNKNOWN',
-          phase: phases.length ? phases.map((x) => x.replace('PHASE', 'Phase ').replace('EARLY_Phase 1', 'Early Phase 1')).join('/') : 'N/A',
-          bucket: bucketPhase(phases.join('/')),
-          enrollment: (dsm.enrollmentInfo && dsm.enrollmentInfo.count) || null,
-          primaryOutcome: (oem.primaryOutcomes || []).map((o) => o.measure).slice(0, 3).join('; '),
-          startDate: (stm.startDateStruct && stm.startDateStruct.date) || '',
-          completionDate: (stm.completionDateStruct && stm.completionDateStruct.date) || '',
-        };
-      }).filter((s) => s.nctId && !seen.has(s.nctId) && seen.add(s.nctId));
+      const studies = (json.studies || []).map(mapTrial).filter((s) => s.nctId);
       return { studies, count: json.totalCount != null ? json.totalCount : studies.length };
+    }
+
+    async function fetchTrials(parsed) {
+      // A dedicated pull of enrolling trials (recruiting / not-yet / by-invitation)
+      // so joinable trials surface even when hundreds of completed ones dominate the
+      // general result set.
+      const [general, enrolling] = await Promise.all([
+        ctgovQuery(parsed),
+        ctgovQuery(parsed, { 'filter.overallStatus': ENROLLING_STATUSES }).catch(() => ({ studies: [], count: 0 })),
+      ]);
+      const seen = new Set();
+      const studies = [...enrolling.studies, ...general.studies].filter((s) => s.nctId && !seen.has(s.nctId) && seen.add(s.nctId));
+      return { studies, recruiting: enrolling.studies, recruitingCount: enrolling.count, count: general.count };
     }
 
     // OpenFDA cascade: try several drug-name fields before giving up, so rare-disease
@@ -1017,7 +1034,15 @@ Block schemas (include only the blocks requested in the user message):
       );
     }
 
-    function TrialTable({ trials }) {
+    function ctgovSearchUrl(parsed, recruitingOnly) {
+      const p = new URLSearchParams();
+      if (parsed && parsed.condition) p.set('cond', parsed.condition);
+      if (parsed && parsed.drug) p.set('intr', parsed.drug);
+      if (recruitingOnly) p.set('aggFilters', 'status:rec not');
+      return `https://clinicaltrials.gov/search?${p.toString()}`;
+    }
+
+    function TrialTable({ trials, limit = 12 }) {
       const statusColor = (s) => {
         const u = String(s || '').toUpperCase();
         if (u.includes('RECRUIT')) return 'text-strong bg-emerald-50';
@@ -1027,7 +1052,7 @@ Block schemas (include only the blocks requested in the user message):
         return 'text-sub bg-slate-100';
       };
       const pretty = (s) => String(s || '').replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-      if (trials.length === 0) return null;
+      if (!trials || trials.length === 0) return null;
       return (
         <div className="overflow-x-auto rounded-xl border border-edge">
           <table className="w-full text-sm">
@@ -1040,7 +1065,7 @@ Block schemas (include only the blocks requested in the user message):
               </tr>
             </thead>
             <tbody>
-              {trials.slice(0, 12).map((t) => (
+              {trials.slice(0, limit).map((t) => (
                 <tr key={t.nctId} className="border-t border-edge hover:bg-slate-50/60">
                   <td className="px-4 py-3 max-w-md">
                     <a href={`https://clinicaltrials.gov/study/${t.nctId}`} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
@@ -1055,6 +1080,24 @@ Block schemas (include only the blocks requested in the user message):
               ))}
             </tbody>
           </table>
+        </div>
+      );
+    }
+
+    function TrialGroup({ title, subtitle, trials, totalCount, moreUrl, accent }) {
+      const shown = Math.min((trials || []).length, 12);
+      return (
+        <div>
+          <div className="flex items-center justify-between gap-3 flex-wrap mb-1">
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: accent }}></span>
+              <h4 className="font-display text-lg text-ink">{title}</h4>
+              {totalCount != null && <span className="font-num text-xs text-sub bg-slate-100 px-2 py-0.5 rounded-full">{fmtInt(totalCount)}</span>}
+            </div>
+            {moreUrl && totalCount > shown && <a href={moreUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-accent hover:underline">View all {fmtInt(totalCount)} on ClinicalTrials.gov →</a>}
+          </div>
+          {subtitle && <p className="text-sm text-sub mb-3">{subtitle}</p>}
+          {(trials && trials.length) ? <TrialTable trials={trials} limit={12} /> : <p className="text-sm text-sub italic">None found in this search.</p>}
         </div>
       );
     }
@@ -1522,6 +1565,8 @@ Block schemas (include only the blocks requested in the user message):
       const allOneYear = (!raw.fullTimeline || raw.fullTimeline.length < 2) && raw.pubmed.papers.length > 0 && uniq(raw.pubmed.papers.map((p) => p.year).filter(Boolean)).length <= 1;
       const stats = synthesis.keyStatistics || [];
       const trials = raw.trials.studies;
+      const isEnrolling = (s) => { const u = String(s || '').toUpperCase(); return u.includes('RECRUIT') || u.includes('ENROLL') || u.includes('AVAILABLE'); };
+      const completedTrials = trials.filter((t) => !isEnrolling(t.status));
       return (
         <div className="space-y-10 mt-8">
           {/* Header */}
@@ -1578,30 +1623,38 @@ Block schemas (include only the blocks requested in the user message):
             </Section>
           )}
 
-          {/* Evidence quality mix */}
+          {/* 1. Trial access — "Can I join a trial / is it available?" Recruiting-first. */}
+          <Section title="Clinical trials & access" subtitle="Trials you might be able to join come first, then completed studies and the overall landscape." icon="flask">
+            <div className="grid lg:grid-cols-3 gap-5">
+              <div className="lg:col-span-2 space-y-6">
+                <TrialGroup title="Recruiting & upcoming" subtitle="May be accepting participants — always confirm eligibility with the study team on ClinicalTrials.gov." trials={raw.trials.recruiting} totalCount={raw.trials.recruitingCount} moreUrl={ctgovSearchUrl(raw.parsed, true)} accent="#059669" />
+                <TrialGroup title="Completed & closed" subtitle="Finished, terminated, or no-longer-enrolling trials — the outcomes evidence base." trials={completedTrials} totalCount={raw.trials.count} moreUrl={ctgovSearchUrl(raw.parsed, false)} accent="#1E40AF" />
+              </div>
+              <Card title="Trial status"><TrialStatusDonut trials={trials} /></Card>
+            </div>
+            <div className="mt-5"><PhaseRow trials={trials} outcomesByPhase={synthesis.outcomesByPhase} /></div>
+          </Section>
+
+          {/* 2. Safety — "Is it safe?" (drug queries) */}
+          <AdverseEventBar fda={raw.fda} />
+
+          {/* 3. Evidence strength — "How strong is the evidence?" */}
           {Object.keys(raw.pubmed.typeCounts || {}).length > 0 && (
             <Section title="Evidence quality mix" subtitle="What kinds of studies make up this evidence base — a quick read on how strong the literature is." icon="layers">
               <div className="bg-white rounded-xl border border-edge shadow-card p-6"><EvidencePyramid typeCounts={raw.pubmed.typeCounts} /></div>
             </Section>
           )}
 
-          {/* Research timeline */}
-          <Section title="Research timeline" subtitle="Publications per year across all of PubMed — true full-corpus counts, not a sample of 200. Last 30 years.">
-            <div className="bg-white rounded-xl border border-edge shadow-card p-5"><ResearchTimeline data={timeline} allOneYear={allOneYear} onBroaden={onBroaden} /></div>
-          </Section>
-
-          {/* Clinical trial landscape */}
-          <Section title="Clinical trial landscape" subtitle="Status, scale, and phase of the registered trials behind this evidence." icon="flask">
-            <div className="grid md:grid-cols-2 gap-5 mb-5">
-              <Card title="Trial status"><TrialStatusDonut trials={trials} /></Card>
-              <Card title="Enrollment by trial" icon="bars"><EnrollmentBar trials={trials} /></Card>
+          {/* 4. Research landscape (secondary detail): trend over time + trial scale */}
+          <Section title="Research landscape" subtitle="Secondary context — how much research exists over time, and the scale of the trials.">
+            <div className="grid lg:grid-cols-2 gap-5">
+              <Card title="Research over time">
+                <ResearchTimeline data={timeline} allOneYear={allOneYear} onBroaden={onBroaden} />
+                <p className="text-xs text-sub mt-2">{`Publications per year for all ${fmtInt(raw.pubmed.totalAvailable)} studies on this topic — the full PubMed timeline (last 30 years).`}</p>
+              </Card>
+              <Card title="Largest trials by enrollment" icon="bars"><EnrollmentBar trials={trials} /></Card>
             </div>
-            <PhaseRow trials={trials} outcomesByPhase={synthesis.outcomesByPhase} />
-            <div className="mt-5"><TrialTable trials={trials} /></div>
           </Section>
-
-          {/* Adverse events */}
-          <AdverseEventBar fda={raw.fda} />
 
           {/* Two perspectives */}
           <Section title="Two perspectives">
